@@ -1,3 +1,10 @@
+baseline/
+data/
+misc/
+models/
+slurm/
+wandb/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
