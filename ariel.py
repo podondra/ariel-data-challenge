@@ -53,14 +53,16 @@ def light_score(quartiles, quartiles_pred):
     return 100 * (10 - np.sqrt(((1 - quartiles_pred / quartiles) ** 2).mean()))
 
 
-def train(Model, trainset, validset, Y_train_mean, Y_train_std, config):
+def train(make_model, trainset, validset, Y_train_mean, Y_train_std, config):
     with wandb.init(config=config, project="ariel"):
         config = wandb.config
-        model = Model(config["dropout_probability"], config["T"])
+        model = make_model(config)
         wandb.watch(model)
         trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
-        # TODO optimise learning rate and weight decay
-        optimiser = optim.Adam(model.parameters())
+        optimiser = optim.Adam(
+                model.parameters(),
+                lr=config["learning_rate"],
+                weight_decay=config["weight_decay"])
         score_valid_best = 0
         i = 0
         while i < config["patience"]:

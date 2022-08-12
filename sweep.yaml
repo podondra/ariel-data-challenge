@@ -1,0 +1,26 @@
+program: train.py
+method: random
+metric:
+    name: light_score_valid
+    goal: maximize
+parameters:
+    batch_size:
+        values: [32, 64, 128, 256]
+    dropout_probability:
+        distribution: log_uniform_values
+        min: 0.001
+        max: 0.5 
+    learning_rate:
+        distribution: log_uniform_values
+        min: 1e-5
+        max: 1
+    patience:
+        values: [16, 32, 64]
+    n_hiddens:
+        values: [32, 64, 128, 256, 512, 1024, 2048]
+    T:
+        values: [32, 64, 128, 256, 512, 1025, 2048, 4096]
+    weight_decay:
+        distribution: log_uniform_values
+        min: 1e-10
+        max: 1
