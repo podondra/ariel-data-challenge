@@ -6,6 +6,7 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 import torch
 from torch import optim
+from torch.utils.data import DataLoader
 import wandb
 
 
@@ -48,43 +49,27 @@ def unstandardise(tensor, mean, std):
     return tensor * std + mean
 
 
-@torch.no_grad()
-def sample(model, X, T=128):
-    # T = 5000 is the maximum for this competition
-    Y_pred = torch.zeros(X.shape[0], T, N_TARGETS)
-    for i in range(X.shape[0]):
-        Y_pred[i] = model(X[i:i + 1].expand(T, -1, -1))
-    return Y_pred
-
-
 def light_score(quartiles, quartiles_pred):
     return 100 * (10 - np.sqrt(((1 - quartiles_pred / quartiles) ** 2).mean()))
 
 
-def evaluate(model, dataset, Y_train_mean, Y_train_std):
-    X, quartiles = dataset
-    Y_pred = sample(model, X)
-    Y_pred = unstandardise(Y_pred, Y_train_mean, Y_train_std)
-    quartiles_pred = np.quantile(Y_pred, QUARTILES, axis=1)
-    return light_score(quartiles, quartiles_pred)
-
-
-def train(model, trainloader, validset, Y_train_mean, Y_train_std, patience=4):
-    config = dict(
-            patience=patience,
-            modelname=model.__class__.__name__)
+def train(Model, trainset, validset, Y_train_mean, Y_train_std, config):
     with wandb.init(config=config, project="ariel"):
+        config = wandb.config
+        model = Model(config["dropout_probability"], config["T"])
         wandb.watch(model)
+        trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
+        # TODO optimise learning rate and weight decay
         optimiser = optim.Adam(model.parameters())
         score_valid_best = 0
         i = 0
-        while i < patience:
+        while i < config["patience"]:
             for X_batch, Y_batch in trainloader:
                 optimiser.zero_grad()
                 loss = model.loss(model(X_batch), Y_batch)
                 loss.backward()
                 optimiser.step()
-            score_valid = evaluate(model, validset, Y_train_mean, Y_train_std)
+            score_valid = model.evaluate(validset, Y_train_mean, Y_train_std)
             if score_valid > score_valid_best:
                 i = 0
                 score_valid_best = score_valid
@@ -94,4 +79,4 @@ def train(model, trainloader, validset, Y_train_mean, Y_train_std, patience=4):
             wandb.log({"light_score_valid": score_valid})
             wandb.run.summary["light_score_valid"] = score_valid_best
         model.load_state_dict(model_state_best)
-        torch.save(model_state_best, f"models/{model.__class__.__name__.lower()}.pt")
+        torch.save(model_state_best, f"models/{wandb.run.name}.pt")
