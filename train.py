@@ -8,10 +8,20 @@ from torch.utils.data import TensorDataset
 import ariel
 
 
+HYPERPARAMETER_DEFAULTS = dict(
+        batch_size=256,
+        dropout_probability=0.003,
+        learning_rate=0.0008,
+        patience=32,
+        n_hiddens=128,
+        T=256,
+        weight_decay=0.000001)
+
+
 class Model(nn.Module):
-    def __init__(self, dropout_probability, n_hiddens, T):
+    def __init__(self, config):
         super(Model, self).__init__()
-        self.T = T
+        self.T = config["T"]
         self.model = nn.Sequential(
             nn.Conv1d(1, 8, 3, padding="same"),
             nn.ReLU(),
@@ -25,13 +35,13 @@ class Model(nn.Module):
             nn.ReLU(),
             nn.MaxPool1d(2),
             nn.Flatten(),
-            nn.Linear(192, n_hiddens),
+            nn.Linear(192, config["n_hiddens"]),
             nn.ReLU(),
-            nn.Dropout(dropout_probability),
-            nn.Linear(n_hiddens, n_hiddens),
+            nn.Dropout(config["dropout_probability"]),
+            nn.Linear(config["n_hiddens"], config["n_hiddens"]),
             nn.ReLU(),
-            nn.Dropout(dropout_probability),
-            nn.Linear(n_hiddens, ariel.N_TARGETS))
+            nn.Dropout(config["dropout_probability"]),
+            nn.Linear(config["n_hiddens"], ariel.N_TARGETS))
         self.cuda()
 
     def forward(self, X):
@@ -54,10 +64,6 @@ class Model(nn.Module):
         Y_pred = ariel.unstandardise(Y_pred, Y_train_mean, Y_train_std)
         quartiles_pred = np.quantile(Y_pred, ariel.QUARTILES, axis=1)
         return ariel.light_score(quartiles, quartiles_pred)
-
-
-def make_model(config):
-    return Model(config["dropout_probability"], config["n_hiddens"], config["T"])
 
 
 if __name__ == "__main__":
@@ -88,18 +94,9 @@ if __name__ == "__main__":
     X_train, X_valid = X_train.cuda(), X_valid.cuda()
     Y_train = Y_train.cuda()
 
-    hyperparameter_defaults = dict(
-            batch_size=256,
-            dropout_probability=0.1,
-            learning_rate=0.001,
-            patience=32,
-            n_hiddens=128,
-            T=128,
-            weight_decay=0)
-
     ariel.train(
-            make_model,
+            Model,
             TensorDataset(X_train, Y_train),
             (X_valid, quartiles_valid),
             Y_train_mean, Y_train_std,
-            hyperparameter_defaults)
+            HYPERPARAMETER_DEFAULTS)

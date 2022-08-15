@@ -53,10 +53,36 @@ def light_score(quartiles, quartiles_pred):
     return 100 * (10 - np.sqrt(((1 - quartiles_pred / quartiles) ** 2).mean()))
 
 
-def train(make_model, trainset, validset, Y_train_mean, Y_train_std, config):
-    with wandb.init(config=config, project="ariel"):
+def light_track_format(quartiles, filename="data/light_track.csv"):
+    # prepares submission file for the light track
+    # assume test data are arranged in assending order of the planet ID
+    df = pd.DataFrame()
+    df.index.name = "planet_ID"
+    for i, target in enumerate(['T', 'log_H2O', 'log_CO2','log_CH4','log_CO','log_NH3']):
+        for j, quartile in enumerate(['q1','q2','q3']):
+            df[target + "_" + quartile] = quartiles[j, :, i]
+    df.to_csv(filename)
+    return df
+
+
+def regular_track_format(traces, weights=None, filename="data/regular_track.hdf5"):
+    # convert input into regular track format
+    # assume that test data are arranged in assending order of the planet ID
+    # weight takes into account the importance of each point in the tracedata
+    if weights is None:
+        weights = np.full(traces.shape[:2], 1 / traces.shape[1])
+    with h5py.File(filename, "w") as tracefile:
+        for i, (trace, weight) in enumerate(zip(traces, weights)):
+            grp = tracefile.create_group("Planet_" + str(i))
+            grp.attrs['ID'] = i
+            grp.create_dataset('tracedata', data=trace)
+            grp.create_dataset('weights', data=weight)
+
+
+def train(Model, trainset, validset, Y_train_mean, Y_train_std, config):
+    with wandb.init(config=config, project="ariel-data-challenge"):
         config = wandb.config
-        model = make_model(config)
+        model = Model(config)
         wandb.watch(model)
         trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
         optimiser = optim.Adam(
