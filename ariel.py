@@ -19,15 +19,16 @@ QUARTILES = [0.16, 0.5, 0.84]
 N = 21987
 HYPERPARAMETER_DEFAULTS = dict(
         batch_size=256,
-        learning_rate=1e-5,
-        patience=1024,
-        n_hiddens=512,
+        learning_rate=0.0002,
+        patience=2048,
+        n_hiddens=7,
+        n_neurons=128,
         weight_decay=0)
 
 
 def read_spectra(path="data/train/spectra.hdf5", n=N):
     with h5py.File(path, "r") as file:
-        X = torch.zeros((n, 1, 52))
+        X = torch.zeros((n, 1, 52), dtype=torch.float64)
         for i in range(n):
             key = "Planet_" + str(i)
             X[i, 0] = torch.from_numpy(file[key]["instrument_spectrum"][:])
@@ -36,7 +37,7 @@ def read_spectra(path="data/train/spectra.hdf5", n=N):
 
 def read_fm_parameter_table(path="data/train/ground_truth/fm_parameter_table.csv", n=N):
     fm_parameter = pd.read_csv(path, index_col="planet_ID", nrows=n)
-    return torch.from_numpy(fm_parameter.values).float()
+    return torch.from_numpy(fm_parameter.values)
 
 
 def read_quartiles_table(path="data/train/ground_truth/quartiles_table.csv", n=N):
@@ -88,6 +89,43 @@ def regular_track_format(traces, weights=None, filename="data/regular_track.hdf5
             grp.create_dataset('weights', data=weight)
 
 
+class Model(nn.Module):
+    def __init__(self, config):
+        super(Model, self).__init__()
+        self.n_neurons = config["n_neurons"]
+        self.n_hiddens = config["n_hiddens"]
+        self.input = nn.Linear(N_WAVES, self.n_neurons)
+        self.linears = []
+        for i in range(1, self.n_hiddens + 1):
+            self.linears.append(nn.Linear(self.n_neurons, self.n_neurons))
+            self.add_module("linear" + str(i), self.linears[-1])
+        self.output = nn.Linear(self.n_neurons, 2 * N_TARGETS)
+        if torch.cuda.is_available():
+            self.cuda()
+
+    def forward(self, X):
+        X = torch.flatten(X, 1)
+        X = F.relu(self.input(X))
+        for linear in self.linears:
+            X = F.relu(linear(X))
+        X = self.output(X)
+        mean, var = X[:, :N_TARGETS], X[:, N_TARGETS:]
+        var = F.softplus(var) + 1e-6
+        return mean, var
+
+    def loss(self, Y_pred, Y):
+        mean, var = Y_pred[0], Y_pred[1]
+        return torch.mean(0.5 * torch.log(var) + ((Y - mean).square()) / (2 * var))
+
+    def evaluate(self, dataset):
+        X, quartiles = dataset
+        mean, var = self(X)
+        mean, var = mean.cpu().numpy(), var.cpu().numpy()
+        std = np.sqrt(var)
+        quartiles_pred = np.stack([norm.ppf(quartile, loc=mean, scale=std) for quartile in QUARTILES])
+        return light_score(quartiles, quartiles_pred)
+
+
 def train(Model, trainset, validset, config):
     X_train, Y_train, quartiles_train = trainset
     X_valid, Y_valid, quartiles_valid = validset
@@ -131,7 +169,8 @@ def train(Model, trainset, validset, config):
                 "loss_train": loss_train,
                 "loss_valid": loss_valid,
                 "light_score_train": score_train,
-                "light_score_valid": score_valid})
+                "light_score_valid": score_valid,
+                "light_score_valid_best": score_valid_best})
             wandb.run.summary["loss_train"] = loss_train_at_best
             wandb.run.summary["loss_valid"] = loss_valid_at_best
             wandb.run.summary["light_score_train"] = score_train_at_best
@@ -140,53 +179,11 @@ def train(Model, trainset, validset, config):
         torch.save(model_state_best, f"models/{wandb.run.name}.pt")
 
 
-class Model(nn.Module):
-    def __init__(self, config):
-        super(Model, self).__init__()
-        self.model = nn.Sequential(
-            nn.Conv1d(1, 8, 3, padding="same"),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-            nn.Conv1d(8, 16, 3, padding="same"),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-            nn.Conv1d(16, 32, 3, padding="same"),
-            nn.ReLU(),
-            nn.Conv1d(32, 32, 3, padding="same"),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-            nn.Flatten(),
-            nn.Linear(192, config["n_hiddens"]),
-            nn.ReLU(),
-            nn.Linear(config["n_hiddens"], config["n_hiddens"]),
-            nn.ReLU(),
-            nn.Linear(config["n_hiddens"], 2 * N_TARGETS))
-        self.cuda()
-
-    def forward(self, X):
-        output = self.model(X)
-        mean, var = output[:, :N_TARGETS], output[:, N_TARGETS:]
-        var = F.softplus(var) + 1e-6
-        return mean, var
-
-    def loss(self, Y_pred, Y):
-        mean, var = Y_pred[0], Y_pred[1]
-        return torch.mean(0.5 * torch.log(var) + ((Y - mean).square()) / (2 * var))
-
-    def evaluate(self, dataset):
-        X, quartiles = dataset
-        mean, var = self(X)
-        mean, var = mean.cpu().numpy(), var.cpu().numpy()
-        std = np.sqrt(var)
-        quartiles_pred = np.stack([norm.ppf(quartile, loc=mean, scale=std) for quartile in QUARTILES])
-        return light_score(quartiles, quartiles_pred)
-
-
 if __name__ == "__main__":
     # get data
     X = read_spectra()
     quartiles = read_quartiles_table()
-    Y = torch.from_numpy(quartiles[1]).float()
+    Y = torch.from_numpy(quartiles[1])
 
     # train and validation set split
     # TODO out-of-distribution split?
@@ -203,6 +200,9 @@ if __name__ == "__main__":
     X_train_mean, X_train_std = X_train.mean(), X_train.std()
     X_train = standardise(X_train, X_train_mean, X_train_std)
     X_valid = standardise(X_valid, X_train_mean, X_train_std)
+
+    X_train, X_valid = X_train.float(), X_valid.float()
+    Y_train, Y_valid = Y_train.float(), Y_valid.float()
 
     X_train, X_valid = X_train.cuda(), X_valid.cuda()
     Y_train, Y_valid = Y_train.cuda(), Y_valid.cuda()
