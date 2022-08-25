@@ -107,8 +107,9 @@ def standardise(tensor, mean, std):
 
 
 class SpectraDataset(Dataset):
-    def __init__(self, X, Y, quartiles, X_mean, X_std):
+    def __init__(self, X, auxillary, Y, quartiles, X_mean, X_std):
         self.X = X
+        self.auxillary = auxillary
         self.Y = Y
         self.quartiles = quartiles
         self.X_mean = X_mean
@@ -118,15 +119,16 @@ class SpectraDataset(Dataset):
         return self.X.shape[0]
 
     def __getitem__(self, idx):
-        x, y = self.X[idx], self.Y[idx]
+        x, aux, y = self.X[idx], self.auxillary[idx], self.Y[idx]
         x = (x - self.X_mean) / self.X_std
-        return x, y
+        return x, aux, y
 
 
 class NoisySpectraDataset(Dataset):
-    def __init__(self, X, noise, Y, quartiles, X_mean, X_std):
+    def __init__(self, X, noise, auxillary, Y, quartiles, X_mean, X_std):
         self.X = X
         self.noise = noise
+        self.auxillary = auxillary
         self.Y = Y
         self.quartiles = quartiles
         self.X_mean = X_mean
@@ -136,10 +138,10 @@ class NoisySpectraDataset(Dataset):
         return self.X.shape[0]
 
     def __getitem__(self, idx):
-        x, y = self.X[idx], self.Y[idx]
+        x, aux, y = self.X[idx], self.auxillary[idx], self.Y[idx]
         x = x + torch.normal(torch.tensor(0.0, device=torch.device("cuda")), noise_train[idx])
         x = (x - self.X_mean) / self.X_std
-        return x, y
+        return x, aux, y
 
 
 class Model(nn.Module):
@@ -147,7 +149,7 @@ class Model(nn.Module):
         super(Model, self).__init__()
         self.n_neurons = config["n_neurons"]
         self.n_hiddens = config["n_hiddens"]
-        self.input = nn.Linear(N_WAVES, self.n_neurons)
+        self.input = nn.Linear(N_WAVES + N_AUXILLARY, self.n_neurons)
         self.linears = []
         for i in range(1, self.n_hiddens + 1):
             self.linears.append(nn.Linear(self.n_neurons, self.n_neurons))
@@ -156,7 +158,8 @@ class Model(nn.Module):
         if torch.cuda.is_available():
             self.cuda()
 
-    def forward(self, X):
+    def forward(self, X, aux):
+        X = torch.cat((X, aux), dim=1)
         X = F.relu(self.input(X))
         for linear in self.linears:
             X = F.relu(linear(X))
@@ -172,7 +175,7 @@ class Model(nn.Module):
     @torch.no_grad()
     def predict(self, dataset, batch_size=2048):
         dataloader = DataLoader(dataset, batch_size=batch_size)
-        mean, var = list(zip(*[self(X_batch) for X_batch, _ in dataloader]))
+        mean, var = list(zip(*[self(X_batch, aux_batch) for X_batch, aux_batch, _ in dataloader]))
         mean, var = torch.concat(mean), torch.concat(var)
         return mean, var
 
@@ -198,9 +201,9 @@ def train(Model, trainset, validset, config):
         i = 0
         while i < config["patience"]:
             model.train()
-            for X_batch, Y_batch in trainloader:
+            for X_batch, aux_batch, Y_batch in trainloader:
                 optimiser.zero_grad()
-                loss = model.loss(model(X_batch), Y_batch)
+                loss = model.loss(model(X_batch, aux_batch), Y_batch)
                 loss.backward()
                 optimiser.step()
             model.eval()
@@ -269,7 +272,12 @@ if __name__ == "__main__":
     Y_train, Y_valid = Y_train.cuda(), Y_valid.cuda()
 
     trainset = NoisySpectraDataset(
-            X_train, noise_train, Y_train, quartiles_train, X_train_mean, X_train_std)
-    validset = SpectraDataset(X_valid, Y_valid, quartiles_valid, X_train_mean, X_train_std)
+            X_train, noise_train, auxillary_train,
+            Y_train, quartiles_train,
+            X_train_mean, X_train_std)
+    validset = SpectraDataset(
+            X_valid, auxillary_valid,
+            Y_valid, quartiles_valid,
+            X_train_mean, X_train_std)
 
     model = train(Model, trainset, validset, HYPERPARAMETER_DEFAULTS)
