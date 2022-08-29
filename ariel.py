@@ -14,7 +14,7 @@ import wandb
 
 
 N_WAVES = 52
-N_AUXILLARY = 9
+N_AUXILIARY = 9
 N_TARGETS = 6
 QUARTILES = [0.16, 0.5, 0.84]
 N = 21987
@@ -23,8 +23,7 @@ HYPERPARAMETER_DEFAULTS = dict(
         learning_rate=0.0001,
         patience=2048,
         n_hiddens=7,
-        n_neurons=128,
-        weight_decay=0)
+        n_neurons=128)
 
 
 def read_spectra(path="data/train/spectra.hdf5", n=N):
@@ -41,19 +40,21 @@ def read_spectra(path="data/train/spectra.hdf5", n=N):
 
 def read_traces(path="data/train/ground_truth/traces.hdf5", n=N):
     with h5py.File(path, "r") as file:
-        mean = torch.zeros((n, 6))
-        var = torch.zeros((n, 6))
+        means = torch.zeros((n, 6))
+        variances = torch.zeros((n, 6))
         for i in range(n):
             key = "Planet_" + str(i)
             tracedata = file[key]["tracedata"][:]
             weights = file[key]["weights"][:]
-            mean[i] = torch.from_numpy(tracedata.T @ weights)
-    return mean
+            mean = tracedata.T @ weights
+            means[i] = torch.from_numpy(mean)
+            variances[i] = torch.from_numpy(np.square(tracedata - mean).T @ weights)
+    return means, variances
 
 
-def read_auxillary_table(path="data/train/auxillary_table.csv", n=N):
-    auxillary = pd.read_csv(path, index_col="planet_ID", nrows=n)
-    return torch.from_numpy(auxillary.values).float()
+def read_auxiliary_table(path="data/train/auxiliary_table.csv", n=N):
+    auxiliary = pd.read_csv(path, index_col="planet_ID", nrows=n)
+    return torch.from_numpy(auxiliary.values).float()
 
 
 def read_fm_parameter_table(path="data/train/ground_truth/fm_parameter_table.csv", n=N):
@@ -107,28 +108,26 @@ def standardise(tensor, mean, std):
 
 
 class SpectraDataset(Dataset):
-    def __init__(self, X, auxillary, Y, quartiles, X_mean, X_std):
-        self.X = X
-        self.auxillary = auxillary
+    def __init__(self, X, auxiliary, Y, quartiles, X_mean, X_std):
+        self.X = standardise(X, X_mean, X_std)
+        self.auxiliary = auxiliary
         self.Y = Y
         self.quartiles = quartiles
-        self.X_mean = X_mean
-        self.X_std = X_std
 
     def __len__(self):
         return self.X.shape[0]
 
     def __getitem__(self, idx):
-        x, aux, y = self.X[idx], self.auxillary[idx], self.Y[idx]
-        x = (x - self.X_mean) / self.X_std
-        return x, aux, y
+        return self.X[idx], self.auxiliary[idx], (self.Y[0][idx], self.Y[1][idx])
 
 
 class NoisySpectraDataset(Dataset):
-    def __init__(self, X, noise, auxillary, Y, quartiles, X_mean, X_std):
+    # TODO scale noise and standardise in __init__
+    # TODO correct indexing of Y
+    def __init__(self, X, noise, auxiliary, Y, quartiles, X_mean, X_std):
         self.X = X
         self.noise = noise
-        self.auxillary = auxillary
+        self.auxiliary = auxiliary
         self.Y = Y
         self.quartiles = quartiles
         self.X_mean = X_mean
@@ -138,10 +137,28 @@ class NoisySpectraDataset(Dataset):
         return self.X.shape[0]
 
     def __getitem__(self, idx):
-        x, aux, y = self.X[idx], self.auxillary[idx], self.Y[idx]
+        x, auxiliary, y = self.X[idx], self.auxiliary[idx], self.Y[idx]
         x = x + torch.normal(torch.tensor(0.0, device=torch.device("cuda")), noise_train[idx])
         x = (x - self.X_mean) / self.X_std
-        return x, aux, y
+        return x, auxiliary, y
+
+
+def nll(mean_pred, var_pred, mean, var):
+    return torch.mean(0.5 * torch.log(var_pred) + 0.5 * (mean - mean_pred).square() / var_pred)
+
+
+def kl_divergence(mean_pred, var_pred, mean, var):
+    return (torch.log(torch.sqrt(var_pred) / torch.sqrt(var))
+            + 0.5 * (var + torch.square(mean_pred - mean)) / var_pred - 0.5)
+
+
+def crps(mean_pred, var_pred, mean, var):
+    std_pred = torch.sqrt(var_pred)
+    mean_std = (mean - mean_pred) / std_pred
+    pi = torch.tensor(np.pi)
+    pdf = (1.0 / torch.sqrt(2.0 * pi)) * torch.exp(-0.5 * torch.square(mean_std))
+    cdf = 0.5 + 0.5 * torch.erf(mean_std / torch.sqrt(torch.tensor(2.0)))
+    return std_pred * (mean_std * (2.0 * cdf - 1.0) + 2.0 * pdf - 1.0 / torch.sqrt(pi))
 
 
 class Model(nn.Module):
@@ -149,7 +166,7 @@ class Model(nn.Module):
         super(Model, self).__init__()
         self.n_neurons = config["n_neurons"]
         self.n_hiddens = config["n_hiddens"]
-        self.input = nn.Linear(N_WAVES + N_AUXILLARY, self.n_neurons)
+        self.input = nn.Linear(N_WAVES + N_AUXILIARY, self.n_neurons)
         self.linears = []
         for i in range(1, self.n_hiddens + 1):
             self.linears.append(nn.Linear(self.n_neurons, self.n_neurons))
@@ -158,8 +175,8 @@ class Model(nn.Module):
         if torch.cuda.is_available():
             self.cuda()
 
-    def forward(self, X, aux):
-        X = torch.cat((X, aux), dim=1)
+    def forward(self, X, auxiliary):
+        X = torch.cat((X, auxiliary), dim=1)
         X = F.relu(self.input(X))
         for linear in self.linears:
             X = F.relu(linear(X))
@@ -169,13 +186,15 @@ class Model(nn.Module):
         return mean, var
 
     def loss(self, Y_pred, Y):
-        mean, var = Y_pred
-        return torch.mean(0.5 * torch.log(var) + 0.5 * (Y - mean).square() / var)
+        mean_pred, var_pred = Y_pred
+        mean, var = Y
+        return torch.mean(crps(mean_pred, var_pred, mean, var))
 
     @torch.no_grad()
     def predict(self, dataset, batch_size=2048):
         dataloader = DataLoader(dataset, batch_size=batch_size)
-        mean, var = list(zip(*[self(X_batch, aux_batch) for X_batch, aux_batch, _ in dataloader]))
+        output = [self(X_batch, auxiliary_batch) for X_batch, auxiliary_batch, _ in dataloader]
+        mean, var = list(zip(*output))
         mean, var = torch.concat(mean), torch.concat(var)
         return mean, var
 
@@ -191,19 +210,16 @@ def train(Model, trainset, validset, config):
     with wandb.init(config=config, project="ariel-data-challenge"):
         config = wandb.config
         model = Model(config)
-        wandb.watch(model)
+        # TODO wandb.watch(model)
         trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
-        optimiser = optim.Adam(
-                model.parameters(),
-                lr=config["learning_rate"],
-                weight_decay=config["weight_decay"])
+        optimiser = optim.Adam(model.parameters(), lr=config["learning_rate"])
         score_valid_best = float("-inf")
         i = 0
         while i < config["patience"]:
             model.train()
-            for X_batch, aux_batch, Y_batch in trainloader:
+            for X_batch, auxiliary_batch, Y_batch in trainloader:
                 optimiser.zero_grad()
-                loss = model.loss(model(X_batch, aux_batch), Y_batch)
+                loss = model.loss(model(X_batch, auxiliary_batch), Y_batch)
                 loss.backward()
                 optimiser.step()
             model.eval()
@@ -219,8 +235,8 @@ def train(Model, trainset, validset, config):
                 score_train_at_best = score_train
                 loss_train_at_best = loss_train
                 loss_valid_at_best = loss_valid
-                model_state_best = deepcopy(model.state_dict())
-                torch.save(model_state_best, f"models/{wandb.run.name}.pt")
+                model_state_at_best = deepcopy(model.state_dict())
+                torch.save(model_state_at_best, f"models/{wandb.run.name}.pt")
             else:
                 i += 1
             wandb.log({
@@ -233,7 +249,7 @@ def train(Model, trainset, validset, config):
             wandb.run.summary["loss_valid"] = loss_valid_at_best
             wandb.run.summary["light_score_train"] = score_train_at_best
             wandb.run.summary["light_score_valid"] = score_valid_best
-        model.load_state_dict(model_state_best)
+        model.load_state_dict(model_state_at_best)
         return model
 
 
@@ -241,7 +257,7 @@ if __name__ == "__main__":
     spectra = read_spectra()
     X = spectra[1]
     noise = spectra[2]
-    auxillary = read_auxillary_table()
+    auxiliary = read_auxiliary_table()
     quartiles = read_quartiles_table()
     Y = read_traces()
 
@@ -255,28 +271,28 @@ if __name__ == "__main__":
 
     X_train, X_valid = X[idx_train], X[idx_valid]
     noise_train, noise_valid = noise[idx_train], noise[idx_valid]
-    auxillary_train, auxillary_valid = auxillary[idx_train], auxillary[idx_valid]
-    Y_train, Y_valid = Y[idx_train], Y[idx_valid]
+    auxiliary_train, auxiliary_valid = auxiliary[idx_train], auxiliary[idx_valid]
+    Y_train, Y_valid = (Y[0][idx_train], Y[1][idx_train]), (Y[0][idx_valid], Y[1][idx_valid])
     quartiles_train, quartiles_valid = quartiles[:, idx_train], quartiles[:, idx_valid]
 
     # data preparation
     X_train_mean, X_train_std = X_train.mean(), X_train.std()
-    auxillary_train_mean = auxillary_train.mean(dim=0)
-    auxillary_train_std = auxillary_train.std(dim=0)
-    auxillary_train = standardise(auxillary_train, auxillary_train_mean, auxillary_train_std)
-    auxillary_valid = standardise(auxillary_valid, auxillary_train_mean, auxillary_train_std)
+    auxiliary_train_mean = auxiliary_train.mean(dim=0)
+    auxiliary_train_std = auxiliary_train.std(dim=0)
+    auxiliary_train = standardise(auxiliary_train, auxiliary_train_mean, auxiliary_train_std)
+    auxiliary_valid = standardise(auxiliary_valid, auxiliary_train_mean, auxiliary_train_std)
 
     X_train, X_valid = X_train.cuda(), X_valid.cuda()
     noise_train, noise_valid = noise_train.cuda(), noise_valid.cuda()
-    auxillary_train, auxillary_valid = auxillary_train.cuda(), auxillary_valid.cuda()
-    Y_train, Y_valid = Y_train.cuda(), Y_valid.cuda()
+    auxiliary_train, auxiliary_valid = auxiliary_train.cuda(), auxiliary_valid.cuda()
+    Y_train, Y_valid = (Y_train[0].cuda(), Y_train[1].cuda()), (Y_valid[0].cuda(), Y_valid[1].cuda())
 
-    trainset = NoisySpectraDataset(
-            X_train, noise_train, auxillary_train,
+    trainset = SpectraDataset(
+            X_train, auxiliary_train,
             Y_train, quartiles_train,
             X_train_mean, X_train_std)
     validset = SpectraDataset(
-            X_valid, auxillary_valid,
+            X_valid, auxiliary_valid,
             Y_valid, quartiles_valid,
             X_train_mean, X_train_std)
 
