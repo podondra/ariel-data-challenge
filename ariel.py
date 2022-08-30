@@ -2,6 +2,7 @@ from copy import deepcopy
 
 import h5py
 import numpy as np
+import ot
 import pandas as pd
 from scipy.stats import norm
 from sklearn.model_selection import train_test_split
@@ -10,20 +11,28 @@ from torch import nn
 from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 import wandb
 
 
-N_WAVES = 52
-N_AUXILIARY = 9
-N_TARGETS = 6
-QUARTILES = [0.16, 0.5, 0.84]
-N = 21987
+DEFAULT_PRIOR_BOUNDS = np.array([
+    [0, 3000],    # T range
+    [-12, -2],    # 1. gas range
+    [-12, -2],    # 2. gas range
+    [-12, -2],    # 3. gas range
+    [-12, -2],    # 4. gas range
+    [-12, -2]])    # 5. gas range
 HYPERPARAMETER_DEFAULTS = dict(
         batch_size=256,
-        learning_rate=0.0001,
-        patience=2048,
-        n_hiddens=7,
-        n_neurons=128)
+        learning_rate=0.00001,
+        n_hiddens=5,
+        n_neurons=2048,
+        patience=2048)
+N = 21987
+N_AUXILIARY = 9
+N_TARGETS = 6
+N_WAVES = 52
+QUARTILES = [0.16, 0.5, 0.84]
 
 
 def read_spectra(path="data/train/spectra.hdf5", n=N):
@@ -89,6 +98,34 @@ def light_track_format(quartiles, filename="data/light_track.csv"):
     return df
 
 
+def normalise(array, bounds_matrix):
+    return (array - bounds_matrix[:, 0]) / (bounds_matrix[:, 1] - bounds_matrix[:, 0])
+
+
+def wasserstein(trace1, trace2, w1=None, w2=None, bounds_matrix=DEFAULT_PRIOR_BOUNDS):
+    w1 = ot.unif(len(trace1)) if w1 is None else w1
+    w2 = ot.unif(len(trace2)) if w2 is None else w2
+    trace1 = normalise(trace1, bounds_matrix)
+    trace2 = normalise(trace2, bounds_matrix)
+    M = ot.dist(trace1, trace2)
+    M /= M.max()
+    return ot.emd2(w1, w2, M, numItermax=100000)
+
+
+def regular_score(tracefile, traces_pred, ids):
+    # calculate the score for regular track from a predicted trace matrix (N X M X 6)
+    # and a ground truth HDF5 file
+    score = 0
+    n = ids.shape[0]
+    with h5py.File(tracefile, "r") as traces:
+        for i, trace_pred in tqdm(zip(ids, traces_pred), total=n):
+            key = 'Planet_' + str(i.item())
+            tracedata = traces[key]['tracedata'][:]
+            weights = traces[key]['weights'][:]
+            score += wasserstein(trace_pred, tracedata, w2=weights)
+    return 1000 * (1 - score / n)
+
+
 def regular_track_format(traces, weights=None, filename="data/regular_track.hdf5"):
     # convert input into regular track format
     # assume that test data are arranged in assending order of the planet ID
@@ -108,11 +145,22 @@ def standardise(tensor, mean, std):
 
 
 class SpectraDataset(Dataset):
-    def __init__(self, X, auxiliary, Y, quartiles, X_mean, X_std):
-        self.X = standardise(X, X_mean, X_std)
-        self.auxiliary = auxiliary
+    def __init__(
+            self,
+            ids, X, X_train_mean, X_train_std,
+            auxiliary, auxiliary_train_mean, auxiliary_train_std,
+            Y, quartiles):
+        self.ids = ids
+        self.X = standardise(X, X_train_mean, X_train_std)
+        self.X_train_mean, self.X_train_std = X_train_mean, X_train_std
+        self.auxiliary = standardise(auxiliary, auxiliary_train_mean, auxiliary_train_std)
+        self.auxiliary_train_mean, self.auxiliary_train_std = auxiliary_train_mean, auxiliary_train_std
         self.Y = Y
         self.quartiles = quartiles
+        if torch.cuda.is_available():
+            self.X = self.X.cuda()
+            self.auxiliary = self.auxiliary.cuda()
+            self.Y = (self.Y[0].cuda(), self.Y[1].cuda())
 
     def __len__(self):
         return self.X.shape[0]
@@ -122,25 +170,20 @@ class SpectraDataset(Dataset):
 
 
 class NoisySpectraDataset(Dataset):
-    # TODO scale noise and standardise in __init__
-    # TODO correct indexing of Y
-    def __init__(self, X, noise, auxiliary, Y, quartiles, X_mean, X_std):
-        self.X = X
-        self.noise = noise
-        self.auxiliary = auxiliary
-        self.Y = Y
-        self.quartiles = quartiles
-        self.X_mean = X_mean
-        self.X_std = X_std
+    def __init__(self):
+        # TODO scale noise and standardise X
+        if torch.cuda.is_available():
+            self.zero = torch.tensor(0.0, device=torch.device("cuda"))
+        else:
+            self.zero = torch.tensor(0.0)
+        raise NotImplementedError()
 
     def __len__(self):
         return self.X.shape[0]
 
     def __getitem__(self, idx):
-        x, auxiliary, y = self.X[idx], self.auxiliary[idx], self.Y[idx]
-        x = x + torch.normal(torch.tensor(0.0, device=torch.device("cuda")), noise_train[idx])
-        x = (x - self.X_mean) / self.X_std
-        return x, auxiliary, y
+        x = self.X[idx] + torch.normal(self.zero, self.noise[idx])
+        return x, self.auxiliary[idx], (self.Y[0][idx], self.Y[1][idx])
 
 
 def nll(mean_pred, var_pred, mean, var):
@@ -253,7 +296,7 @@ def train(Model, trainset, validset, config):
         return model
 
 
-if __name__ == "__main__":
+def get_datasets():
     spectra = read_spectra()
     X = spectra[1]
     noise = spectra[2]
@@ -275,25 +318,23 @@ if __name__ == "__main__":
     Y_train, Y_valid = (Y[0][idx_train], Y[1][idx_train]), (Y[0][idx_valid], Y[1][idx_valid])
     quartiles_train, quartiles_valid = quartiles[:, idx_train], quartiles[:, idx_valid]
 
-    # data preparation
     X_train_mean, X_train_std = X_train.mean(), X_train.std()
     auxiliary_train_mean = auxiliary_train.mean(dim=0)
     auxiliary_train_std = auxiliary_train.std(dim=0)
-    auxiliary_train = standardise(auxiliary_train, auxiliary_train_mean, auxiliary_train_std)
-    auxiliary_valid = standardise(auxiliary_valid, auxiliary_train_mean, auxiliary_train_std)
-
-    X_train, X_valid = X_train.cuda(), X_valid.cuda()
-    noise_train, noise_valid = noise_train.cuda(), noise_valid.cuda()
-    auxiliary_train, auxiliary_valid = auxiliary_train.cuda(), auxiliary_valid.cuda()
-    Y_train, Y_valid = (Y_train[0].cuda(), Y_train[1].cuda()), (Y_valid[0].cuda(), Y_valid[1].cuda())
 
     trainset = SpectraDataset(
-            X_train, auxiliary_train,
-            Y_train, quartiles_train,
-            X_train_mean, X_train_std)
+            ids_train,
+            X_train, X_train_mean, X_train_std,
+            auxiliary_train, auxiliary_train_mean, auxiliary_train_std,
+            Y_train, quartiles_train)
     validset = SpectraDataset(
-            X_valid, auxiliary_valid,
-            Y_valid, quartiles_valid,
-            X_train_mean, X_train_std)
+            ids_valid,
+            X_valid, X_train_mean, X_train_std,
+            auxiliary_valid, auxiliary_train_mean, auxiliary_train_std,
+            Y_valid, quartiles_valid)
+    return trainset, validset
 
+
+if __name__ == "__main__":
+    trainset, validset = get_datasets()
     model = train(Model, trainset, validset, HYPERPARAMETER_DEFAULTS)
