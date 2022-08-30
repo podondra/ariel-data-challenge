@@ -4,6 +4,7 @@ misc/
 models/
 slurm/
 wandb/
+worksheet.ipynb
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
