@@ -16,9 +16,10 @@ import wandb
 
 
 DEFAULT_PRIOR_BOUNDS = np.array([[0, -12, -12, -12, -12, -12], [3000, -2, -2, -2, -2, -2]])
-HYPERPARAMETER_DEFAULTS = dict(
+DEFAULT_HYPERPARAMETERS = dict(
         batch_size=256,
         learning_rate=0.0015,
+        loss="kl_divergence",
         n_hiddens=4,
         n_neurons=2048,
         patience=2048)
@@ -202,9 +203,20 @@ def crps(mean_pred, var_pred, mean, var):
 class Model(nn.Module):
     def __init__(self, config):
         super(Model, self).__init__()
+        self.cnn = nn.Sequential(
+                nn.Conv1d(1, 8, 3, padding="same"),
+                nn.MaxPool1d(2),
+                nn.Conv1d(8, 16, 3, padding="same"),
+                nn.MaxPool1d(2),
+                nn.Conv1d(16, 32, 3, padding="same"),
+                nn.Conv1d(32, 32, 3, padding="same"),
+                nn.MaxPool1d(2),
+                nn.Conv1d(32, 64, 3, padding="same"),
+                nn.Conv1d(64, 64, 3, padding="same"),
+                nn.MaxPool1d(2))
         self.n_neurons = config["n_neurons"]
         self.n_hiddens = config["n_hiddens"]
-        self.input = nn.Linear(N_WAVES + N_AUXILIARY, self.n_neurons)
+        self.input = nn.Linear(201, self.n_neurons)
         self.linears = []
         for i in range(1, self.n_hiddens + 1):
             self.linears.append(nn.Linear(self.n_neurons, self.n_neurons))
@@ -212,8 +224,16 @@ class Model(nn.Module):
         self.output = nn.Linear(self.n_neurons, 2 * N_TARGETS)
         if torch.cuda.is_available():
             self.cuda()
+        losses = {
+            "crps": crps,
+            "kl_divergence": kl_divergence,
+            "nll": nll}
+        self.loss_function = losses[config["loss"]]
 
     def forward(self, X, auxiliary):
+        X = torch.unsqueeze(X, 1)
+        X = self.cnn(X)
+        X = torch.flatten(X, start_dim=1)
         X = torch.cat((X, auxiliary), dim=1)
         X = F.relu(self.input(X))
         for linear in self.linears:
@@ -226,7 +246,7 @@ class Model(nn.Module):
     def loss(self, Y_pred, Y):
         mean_pred, var_pred = Y_pred
         mean, var = Y
-        return torch.mean(crps(mean_pred, var_pred, mean, var))
+        return torch.mean(self.loss_function(mean_pred, var_pred, mean, var))
 
     @torch.no_grad()
     def predict(self, dataset, batch_size=2048):
@@ -291,7 +311,10 @@ def train(Model, trainset, validset, config):
         return model
 
 
-def get_dataset(ids, X_train_mean=None, X_train_std=None, auxiliary_train_mean=None, auxiliary_train_std=None):
+def get_dataset(
+        ids,
+        X_train_mean=None, X_train_std=None,
+        auxiliary_train_mean=None, auxiliary_train_std=None):
     spectra = read_spectra(ids)
     X, noise = spectra[1], spectra[2]
     auxiliary = read_auxiliary_table(ids)
@@ -321,4 +344,4 @@ if __name__ == "__main__":
             trainset.X_train_std,
             trainset.auxiliary_train_mean,
             trainset.auxiliary_train_std)
-    model = train(Model, trainset, validset, HYPERPARAMETER_DEFAULTS)
+    model = train(Model, trainset, validset, DEFAULT_HYPERPARAMETERS)

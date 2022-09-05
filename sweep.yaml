@@ -10,6 +10,9 @@ parameters:
         distribution: log_uniform_values
         min: 1e-6
         max: 1e-1
+    loss:
+        distribution: categorical
+        values: ["crps", "kl_divergence", "nll"]
     patience:
         value: 2048
     n_hiddens:
@@ -17,4 +20,4 @@ parameters:
         min: 1
         max: 8
     n_neurons:
-        values: [2, 4, 8, 16, 32, 64, 128, 256, 512, 1025, 2048, 4096]
+        values: [2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
