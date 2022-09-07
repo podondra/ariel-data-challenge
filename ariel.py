@@ -18,10 +18,10 @@ import wandb
 DEFAULT_PRIOR_BOUNDS = np.array([[0, -12, -12, -12, -12, -12], [3000, -2, -2, -2, -2, -2]])
 DEFAULT_HYPERPARAMETERS = dict(
         batch_size=256,
-        learning_rate=0.0015,
-        loss="kl_divergence",
-        n_hiddens=4,
-        n_neurons=2048,
+        learning_rate=0.0001,
+        loss="crps",
+        n_hiddens=5,
+        n_neurons=1024,
         patience=2048)
 N = 21987
 N_AUXILIARY = 9
@@ -205,14 +205,20 @@ class Model(nn.Module):
         super(Model, self).__init__()
         self.cnn = nn.Sequential(
                 nn.Conv1d(1, 8, 3, padding="same"),
+                nn.ReLU(),
                 nn.MaxPool1d(2),
                 nn.Conv1d(8, 16, 3, padding="same"),
+                nn.ReLU(),
                 nn.MaxPool1d(2),
                 nn.Conv1d(16, 32, 3, padding="same"),
+                nn.ReLU(),
                 nn.Conv1d(32, 32, 3, padding="same"),
+                nn.ReLU(),
                 nn.MaxPool1d(2),
                 nn.Conv1d(32, 64, 3, padding="same"),
+                nn.ReLU(),
                 nn.Conv1d(64, 64, 3, padding="same"),
+                nn.ReLU(),
                 nn.MaxPool1d(2))
         self.n_neurons = config["n_neurons"]
         self.n_hiddens = config["n_hiddens"]
