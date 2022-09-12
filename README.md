@@ -11,3 +11,4 @@ Python 3.9.6 and CUDA 11.3.1.
 1. Add regularisation, e.g. dropout.
 1. Use annotations from forward model?
 1. Data preparation according to F. Ardévol Martínez et al. (2022)?
+1. Out-of-distribution train and validation set split?

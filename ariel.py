@@ -141,14 +141,10 @@ def standardise(tensor, mean, std):
 
 
 class SpectraDataset(Dataset):
-    def __init__(
-            self,
-            ids, X, X_train_mean, X_train_std,
-            auxiliary, auxiliary_train_mean, auxiliary_train_std,
-            Y, quartiles):
+    def __init__(self, ids, X, auxiliary, auxiliary_train_mean, auxiliary_train_std, Y, quartiles):
         self.ids = ids
-        self.X = standardise(X, X_train_mean, X_train_std)
-        self.X_train_mean, self.X_train_std = X_train_mean, X_train_std
+        self.X = (X - X.mean(dim=1, keepdim=True)) / X.std(dim=1, keepdim=True)
+        # TODO remove stadardisation of auxiliaries?
         self.auxiliary = standardise(auxiliary, auxiliary_train_mean, auxiliary_train_std)
         self.auxiliary_train_mean, self.auxiliary_train_std = auxiliary_train_mean, auxiliary_train_std
         self.Y = Y
@@ -317,10 +313,7 @@ def train(Model, trainset, validset, config):
         return model
 
 
-def get_dataset(
-        ids,
-        X_train_mean=None, X_train_std=None,
-        auxiliary_train_mean=None, auxiliary_train_std=None):
+def get_dataset(ids, auxiliary_train_mean=None, auxiliary_train_std=None):
     spectra = read_spectra(ids)
     X, noise = spectra[1], spectra[2]
     auxiliary = read_auxiliary_table(ids)
@@ -329,8 +322,6 @@ def get_dataset(
     return SpectraDataset(
             ids,
             X,
-            X.mean() if X_train_mean is None else X_train_mean,
-            X.std() if X_train_std is None else X_train_std,
             auxiliary,
             auxiliary.mean(dim=0) if auxiliary_train_mean is None else auxiliary_train_mean,
             auxiliary.std(dim=0) if auxiliary_train_std is None else auxiliary_train_std,
@@ -340,14 +331,8 @@ def get_dataset(
 
 if __name__ == "__main__":
     # train and validation set split
-    # TODO out-of-distribution split?
     ids = np.arange(N)
     ids_train, ids_valid = train_test_split(ids, train_size=0.8, random_state=36)
     trainset = get_dataset(ids_train)
-    validset = get_dataset(
-            ids_valid,
-            trainset.X_train_mean,
-            trainset.X_train_std,
-            trainset.auxiliary_train_mean,
-            trainset.auxiliary_train_std)
+    validset = get_dataset(ids_valid, trainset.auxiliary_train_mean, trainset.auxiliary_train_std)
     model = train(Model, trainset, validset, DEFAULT_HYPERPARAMETERS)
