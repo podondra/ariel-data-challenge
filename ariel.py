@@ -19,7 +19,7 @@ DEFAULT_PRIOR_BOUNDS = np.array([[0, -12, -12, -12, -12, -12], [3000, -2, -2, -2
 DEFAULT_HYPERPARAMETERS = dict(
         batch_size=256,
         learning_rate=0.0001,
-        loss="crps",
+        loss="kl_divergence",
         n_hiddens=5,
         n_neurons=1024,
         patience=2048)
@@ -105,7 +105,7 @@ def wasserstein(trace1, trace2, w2, prior_bounds=DEFAULT_PRIOR_BOUNDS):
     trace2 = normalise(trace2, prior_bounds)
     M = ot.dist(trace1, trace2)
     M /= M.max()
-    return ot.emd2(w1, w2, M, numItermax=100000)
+    return ot.emd2(w1, w2, M)
 
 
 def regular_score(traces_pred, ids, tracefile="data/train/ground_truth/traces.hdf5"):
@@ -144,7 +144,6 @@ class SpectraDataset(Dataset):
     def __init__(self, ids, X, auxiliary, auxiliary_train_mean, auxiliary_train_std, Y, quartiles):
         self.ids = ids
         self.X = (X - X.mean(dim=1, keepdim=True)) / X.std(dim=1, keepdim=True)
-        # TODO remove stadardisation of auxiliaries?
         self.auxiliary = standardise(auxiliary, auxiliary_train_mean, auxiliary_train_std)
         self.auxiliary_train_mean, self.auxiliary_train_std = auxiliary_train_mean, auxiliary_train_std
         self.Y = Y
@@ -159,23 +158,6 @@ class SpectraDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.X[idx], self.auxiliary[idx], (self.Y[0][idx], self.Y[1][idx])
-
-
-class NoisySpectraDataset(Dataset):
-    def __init__(self):
-        # TODO scale noise and standardise X
-        if torch.cuda.is_available():
-            self.zero = torch.tensor(0.0, device=torch.device("cuda"))
-        else:
-            self.zero = torch.tensor(0.0)
-        raise NotImplementedError()
-
-    def __len__(self):
-        return self.X.shape[0]
-
-    def __getitem__(self, idx):
-        x = self.X[idx] + torch.normal(self.zero, self.noise[idx])
-        return x, self.auxiliary[idx], (self.Y[0][idx], self.Y[1][idx])
 
 
 def nll(mean_pred, var_pred, mean, var):
@@ -270,7 +252,6 @@ def train(Model, trainset, validset, config):
     with wandb.init(config=config, project="ariel-data-challenge"):
         config = wandb.config
         model = Model(config)
-        # TODO wandb.watch(model)
         trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
         optimiser = optim.Adam(model.parameters(), lr=config["learning_rate"])
         score_valid_best = float("-inf")
