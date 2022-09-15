@@ -138,7 +138,7 @@ def regular_track_format(traces, weights=None, filename="data/regular_track.hdf5
 
 
 def nll(mean_pred, var_pred, mean, var):
-    return torch.mean(0.5 * torch.log(var_pred) + 0.5 * (mean - mean_pred).square() / var_pred)
+    return 0.5 * torch.log(var_pred) + 0.5 * (mean - mean_pred).square() / var_pred
 
 
 def kl_divergence(mean_pred, var_pred, mean, var):
