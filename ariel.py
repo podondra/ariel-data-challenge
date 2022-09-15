@@ -18,10 +18,11 @@ import wandb
 DEFAULT_PRIOR_BOUNDS = np.array([[0, -12, -12, -12, -12, -12], [3000, -2, -2, -2, -2, -2]])
 DEFAULT_HYPERPARAMETERS = dict(
         batch_size=256,
-        learning_rate=0.0001,
+        dropout_probability=0.08,
+        learning_rate=0.00007,
         loss="kl_divergence",
-        n_hiddens=5,
-        n_neurons=1024,
+        n_hiddens=2,
+        n_neurons=512,
         patience=2048)
 N = 21987
 N_AUXILIARY = 9
@@ -136,30 +137,6 @@ def regular_track_format(traces, weights=None, filename="data/regular_track.hdf5
             grp.create_dataset("weights", data=weight)
 
 
-def standardise(tensor, mean, std):
-    return (tensor - mean) / std
-
-
-class SpectraDataset(Dataset):
-    def __init__(self, ids, X, auxiliary, auxiliary_train_mean, auxiliary_train_std, Y, quartiles):
-        self.ids = ids
-        self.X = (X - X.mean(dim=1, keepdim=True)) / X.std(dim=1, keepdim=True)
-        self.auxiliary = standardise(auxiliary, auxiliary_train_mean, auxiliary_train_std)
-        self.auxiliary_train_mean, self.auxiliary_train_std = auxiliary_train_mean, auxiliary_train_std
-        self.Y = Y
-        self.quartiles = quartiles
-        if torch.cuda.is_available():
-            self.X = self.X.cuda()
-            self.auxiliary = self.auxiliary.cuda()
-            self.Y = (self.Y[0].cuda(), self.Y[1].cuda())
-
-    def __len__(self):
-        return self.X.shape[0]
-
-    def __getitem__(self, idx):
-        return self.X[idx], self.auxiliary[idx], (self.Y[0][idx], self.Y[1][idx])
-
-
 def nll(mean_pred, var_pred, mean, var):
     return torch.mean(0.5 * torch.log(var_pred) + 0.5 * (mean - mean_pred).square() / var_pred)
 
@@ -182,29 +159,44 @@ class Model(nn.Module):
     def __init__(self, config):
         super(Model, self).__init__()
         self.cnn = nn.Sequential(
-                nn.Conv1d(1, 8, 3, padding="same"),
+                nn.Conv1d(1, 8, 3, padding="same", bias=False),
+                nn.BatchNorm1d(8),
                 nn.ReLU(),
                 nn.MaxPool1d(2),
-                nn.Conv1d(8, 16, 3, padding="same"),
+                nn.Conv1d(8, 16, 3, padding="same", bias=False),
+                nn.BatchNorm1d(16),
                 nn.ReLU(),
                 nn.MaxPool1d(2),
-                nn.Conv1d(16, 32, 3, padding="same"),
+                nn.Conv1d(16, 32, 3, padding="same", bias=False),
+                nn.BatchNorm1d(32),
                 nn.ReLU(),
-                nn.Conv1d(32, 32, 3, padding="same"),
+                nn.Conv1d(32, 32, 3, padding="same", bias=False),
+                nn.BatchNorm1d(32),
                 nn.ReLU(),
                 nn.MaxPool1d(2),
-                nn.Conv1d(32, 64, 3, padding="same"),
+                nn.Conv1d(32, 64, 3, padding="same", bias=False),
+                nn.BatchNorm1d(64),
                 nn.ReLU(),
-                nn.Conv1d(64, 64, 3, padding="same"),
+                nn.Conv1d(64, 64, 3, padding="same", bias=False),
+                nn.BatchNorm1d(64),
                 nn.ReLU(),
                 nn.MaxPool1d(2))
         self.n_neurons = config["n_neurons"]
         self.n_hiddens = config["n_hiddens"]
-        self.input = nn.Linear(201, self.n_neurons)
+        self.p = config["dropout_probability"]
+        self.linear0 = nn.Linear(201, self.n_neurons, bias=False)
+        self.dropout0 = nn.Dropout(self.p)
+        self.batchnorm0 = nn.BatchNorm1d(self.n_neurons)
         self.linears = []
+        self.dropouts = []
+        self.batchnorms = []
         for i in range(1, self.n_hiddens + 1):
-            self.linears.append(nn.Linear(self.n_neurons, self.n_neurons))
+            self.linears.append(nn.Linear(self.n_neurons, self.n_neurons, bias=False))
             self.add_module("linear" + str(i), self.linears[-1])
+            self.batchnorms.append(nn.BatchNorm1d(self.n_neurons))
+            self.add_module("batchnorm" + str(i), self.batchnorms[-1])
+            self.dropouts.append(nn.Dropout(self.p))
+            self.add_module("dropout" + str(i), self.dropouts[-1])
         self.output = nn.Linear(self.n_neurons, 2 * N_TARGETS)
         if torch.cuda.is_available():
             self.cuda()
@@ -219,9 +211,11 @@ class Model(nn.Module):
         X = self.cnn(X)
         X = torch.flatten(X, start_dim=1)
         X = torch.cat((X, auxiliary), dim=1)
-        X = F.relu(self.input(X))
-        for linear in self.linears:
-            X = F.relu(linear(X))
+        X = F.relu(self.batchnorm0(self.linear0(X)))
+        X = self.dropout0(X)
+        for linear, batchnorm, dropout in zip(self.linears, self.batchnorms, self.dropouts):
+            X = F.relu(batchnorm(linear(X)))
+            X = dropout(X)
         X = self.output(X)
         mean, var = X[:, :N_TARGETS], X[:, N_TARGETS:]
         var = F.softplus(var) + 1e-6
@@ -248,16 +242,73 @@ class Model(nn.Module):
         return light_score(dataset.quartiles, quartiles_pred)
 
 
-def train(Model, trainset, validset, config):
+def standardise(tensor, mean, std):
+    return (tensor - mean) / std
+
+
+def scale(X):
+    return (X - X.mean(dim=1, keepdim=True)) / X.std(dim=1, keepdim=True)
+
+
+class SpectraDataset(Dataset):
+    def __init__(
+            self, ids, X, noise, auxiliary, Y, quartiles,
+            auxiliary_train_mean=None, auxiliary_train_std=None):
+        self.ids = ids
+        self.X_orig = X
+        self.X = scale(self.X_orig)
+        self.noise = noise
+        self.auxiliary_train_mean = auxiliary_train_mean
+        if self.auxiliary_train_mean is None:
+            self.auxiliary_train_mean = auxiliary.mean(dim=0)
+        self.auxiliary_train_std = auxiliary_train_std
+        if self.auxiliary_train_std is None:
+            self.auxiliary_train_std = auxiliary.std(dim=0)
+        self.auxiliary = standardise(auxiliary, self.auxiliary_train_mean, self.auxiliary_train_std)
+        self.Y = Y
+        self.quartiles = quartiles
+        if torch.cuda.is_available():
+            self.X_orig = self.X_orig.cuda()
+            self.X = self.X.cuda()
+            self.noise = self.noise.cuda()
+            self.auxiliary = self.auxiliary.cuda()
+            self.Y = (self.Y[0].cuda(), self.Y[1].cuda())
+
+    def __len__(self):
+        return self.X.shape[0]
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.auxiliary[idx], (self.Y[0][idx], self.Y[1][idx])
+
+
+class NoisySpectraDataset(SpectraDataset):
+    def sample(self):
+        self.X = scale(self.X_orig + torch.normal(mean=0.0, std=self.noise))
+
+
+def get_dataset(ids):
+    spectra = read_spectra(ids)
+    X, noise = spectra[1], spectra[2]
+    auxiliary = read_auxiliary_table(ids)
+    quartiles = read_quartiles_table(ids)
+    Y = read_traces(ids)
+    return ids, X, noise, auxiliary, Y, quartiles
+
+
+def train(Model, data_train, data_valid, config):
     with wandb.init(config=config, project="ariel-data-challenge"):
         config = wandb.config
         model = Model(config)
-        trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
+        trainset = NoisySpectraDataset(*data_train)
+        validset = SpectraDataset(
+                *data_valid, trainset.auxiliary_train_mean, trainset.auxiliary_train_std)
         optimiser = optim.Adam(model.parameters(), lr=config["learning_rate"])
         score_valid_best = float("-inf")
         i = 0
         while i < config["patience"]:
             model.train()
+            trainset.sample()
+            trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
             for X_batch, auxiliary_batch, Y_batch in trainloader:
                 optimiser.zero_grad()
                 loss = model.loss(model(X_batch, auxiliary_batch), Y_batch)
@@ -294,26 +345,9 @@ def train(Model, trainset, validset, config):
         return model
 
 
-def get_dataset(ids, auxiliary_train_mean=None, auxiliary_train_std=None):
-    spectra = read_spectra(ids)
-    X, noise = spectra[1], spectra[2]
-    auxiliary = read_auxiliary_table(ids)
-    quartiles = read_quartiles_table(ids)
-    Y = read_traces(ids)
-    return SpectraDataset(
-            ids,
-            X,
-            auxiliary,
-            auxiliary.mean(dim=0) if auxiliary_train_mean is None else auxiliary_train_mean,
-            auxiliary.std(dim=0) if auxiliary_train_std is None else auxiliary_train_std,
-            Y,
-            quartiles)
-
-
 if __name__ == "__main__":
-    # train and validation set split
     ids = np.arange(N)
     ids_train, ids_valid = train_test_split(ids, train_size=0.8, random_state=36)
-    trainset = get_dataset(ids_train)
-    validset = get_dataset(ids_valid, trainset.auxiliary_train_mean, trainset.auxiliary_train_std)
-    model = train(Model, trainset, validset, DEFAULT_HYPERPARAMETERS)
+    data_train = get_dataset(ids_train)
+    data_valid = get_dataset(ids_valid)
+    model = train(Model, data_train, data_valid, DEFAULT_HYPERPARAMETERS)
