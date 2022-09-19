@@ -20,6 +20,7 @@ DEFAULT_HYPERPARAMETERS = dict(
         batch_size=256,
         learning_rate=0.0001,
         loss="kl_divergence",
+        n_epochs=2048,
         n_hiddens=5,
         n_neurons=1024,
         patience=2048)
@@ -248,6 +249,28 @@ class Model(nn.Module):
         return light_score(dataset.quartiles, quartiles_pred)
 
 
+def train_epochs(Model, trainset, config):
+    with wandb.init(config=config, project="ariel-data-challenge"):
+        config = wandb.config
+        model = Model(config)
+        trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
+        optimiser = optim.Adam(model.parameters(), lr=config["learning_rate"])
+        for epoch in range(config["n_epochs"]):
+            model.train()
+            for X_batch, auxiliary_batch, Y_batch in trainloader:
+                optimiser.zero_grad()
+                loss = model.loss(model(X_batch, auxiliary_batch), Y_batch)
+                loss.backward()
+                optimiser.step()
+            model.eval()
+            output_train = model.predict(trainset)
+            loss_train = model.loss(output_train, trainset.Y).item()
+            score_train = model.evaluate(output_train, trainset)
+            wandb.log({"loss_train": loss_train, "light_score_train": score_train})
+        torch.save(model.state_dict(), f"models/{wandb.run.name}.pt")
+        return model
+
+
 def train(Model, trainset, validset, config):
     with wandb.init(config=config, project="ariel-data-challenge"):
         config = wandb.config
@@ -312,8 +335,11 @@ def get_dataset(ids, auxiliary_train_mean=None, auxiliary_train_std=None):
 
 if __name__ == "__main__":
     # train and validation set split
-    ids = np.arange(N)
-    ids_train, ids_valid = train_test_split(ids, train_size=0.8, random_state=36)
+    #ids = np.arange(N)
+    #ids_train, ids_valid = train_test_split(ids, train_size=0.8, random_state=36)
+    #trainset = get_dataset(ids_train)
+    #validset = get_dataset(ids_valid, trainset.auxiliary_train_mean, trainset.auxiliary_train_std)
+    #model = train(Model, trainset, validset, DEFAULT_HYPERPARAMETERS)
+    ids_train = np.arange(N)
     trainset = get_dataset(ids_train)
-    validset = get_dataset(ids_valid, trainset.auxiliary_train_mean, trainset.auxiliary_train_std)
-    model = train(Model, trainset, validset, DEFAULT_HYPERPARAMETERS)
+    model = train_epochs(Model, trainset, DEFAULT_HYPERPARAMETERS)
