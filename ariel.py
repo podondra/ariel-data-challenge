@@ -23,6 +23,7 @@ DEFAULT_HYPERPARAMETERS = dict(
         loss="kl_divergence",
         n_hiddens=2,
         n_neurons=512,
+        noisy_spectra=True,
         patience=2048)
 N = 21987
 N_AUXILIARY = 9
@@ -307,7 +308,8 @@ def train(Model, data_train, data_valid, config):
         i = 0
         while i < config["patience"]:
             model.train()
-            trainset.sample()
+            if config["noisy_spectra"]:
+                trainset.sample()
             trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
             for X_batch, auxiliary_batch, Y_batch in trainloader:
                 optimiser.zero_grad()
