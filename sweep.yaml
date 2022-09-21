@@ -1,7 +1,7 @@
 program: ariel.py
 method: random
 metric:
-    name: light_score_valid_best
+    name: light_score_valid
     goal: maximize
 parameters:
     batch_size:
@@ -27,5 +27,3 @@ parameters:
     noisy_spectra:
         distribution: categorical
         values: [False, True]
-    patience:
-        value: 2048
