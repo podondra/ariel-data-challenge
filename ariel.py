@@ -7,6 +7,7 @@ import pandas as pd
 from scipy.stats import norm
 from sklearn.model_selection import train_test_split
 import torch
+from torch import distributions
 from torch import nn
 from torch import optim
 from torch.nn import functional as F
@@ -26,11 +27,14 @@ DEFAULT_HYPERPARAMETERS = dict(
         noisy_spectra=False,
         n_epochs=2048,
         patience=2048)
-N = 21987
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+N = 91392
+N_ANNOTATED = 21988
 N_AUXILIARY = 9
 N_TARGETS = 6
 N_WAVES = 52
 QUARTILES = [0.16, 0.5, 0.84]
+T = 250
 
 
 def read_spectra(ids, path="data/train/spectra.hdf5"):
@@ -49,16 +53,16 @@ def read_spectra(ids, path="data/train/spectra.hdf5"):
 def read_traces(ids, path="data/train/ground_truth/traces.hdf5"):
     n = ids.shape[0]
     with h5py.File(path, "r") as file:
-        means = torch.zeros((n, 6))
-        variances = torch.zeros((n, 6))
+        means = torch.zeros((n, N_TARGETS))
+        covariances = torch.zeros((n, N_TARGETS, N_TARGETS))
         for i, identifier in enumerate(ids):
             key = "Planet_" + str(identifier)
             trace = file[key]["tracedata"][:]
             weights = file[key]["weights"][:]
             mean = trace.T @ weights
             means[i] = torch.from_numpy(mean)
-            variances[i] = torch.from_numpy(np.square(trace - mean).T @ weights)
-    return means, variances
+            covariances[i] = torch.from_numpy((weights * (trace - mean).T @ (trace - mean)))
+    return means, covariances
 
 
 def read_auxiliary_table(ids, path="data/train/auxiliary_table.csv"):
@@ -143,9 +147,12 @@ def nll(mean_pred, var_pred, mean, var):
     return 0.5 * torch.log(var_pred) + 0.5 * (mean - mean_pred).square() / var_pred
 
 
-def kl_divergence(mean_pred, var_pred, mean, var):
-    return (torch.log(torch.sqrt(var_pred) / torch.sqrt(var))
-            + 0.5 * (var + torch.square(mean_pred - mean)) / var_pred - 0.5)
+def kl_divergence(Y_pred, Y):
+    mean_pred, L_pred = Y_pred
+    mean, covariance = Y
+    distribution_pred = distributions.MultivariateNormal(mean_pred, scale_tril=L_pred)
+    distribution = distributions.MultivariateNormal(mean, covariance_matrix=covariance)
+    return distributions.kl.kl_divergence(distribution, distribution_pred)
 
 
 def crps(mean_pred, var_pred, mean, var):
@@ -199,14 +206,15 @@ class Model(nn.Module):
             self.add_module("batchnorm" + str(i), self.batchnorms[-1])
             self.dropouts.append(nn.Dropout(self.p))
             self.add_module("dropout" + str(i), self.dropouts[-1])
-        self.output = nn.Linear(self.n_neurons, 2 * N_TARGETS)
-        if torch.cuda.is_available():
-            self.cuda()
+        self.output = nn.Linear(self.n_neurons, N_TARGETS + N_TARGETS * (N_TARGETS + 1) // 2)
+        self.to(DEVICE)
         losses = {
             "crps": crps,
             "kl_divergence": kl_divergence,
             "nll": nll}
         self.loss_function = losses[config["loss"]]
+        self.ind_diag = torch.arange(N_TARGETS)
+        self.ind_tril = torch.tril_indices(row=N_TARGETS, col=N_TARGETS, offset=-1)
 
     def forward(self, X, auxiliary):
         X = torch.unsqueeze(X, 1)
@@ -219,28 +227,30 @@ class Model(nn.Module):
             X = F.relu(batchnorm(linear(X)))
             X = dropout(X)
         X = self.output(X)
-        mean, var = X[:, :N_TARGETS], X[:, N_TARGETS:]
-        var = F.softplus(var) + 1e-6
-        return mean, var
+        mean = X[:, :N_TARGETS]
+        variance = X[:, N_TARGETS:2 * N_TARGETS]
+        L_vector = X[:, 2 * N_TARGETS:]
+        L = torch.zeros((L_vector.shape[0], N_TARGETS, N_TARGETS), device=DEVICE)
+        L[:, self.ind_diag, self.ind_diag] = F.softplus(variance) + 1e-6
+        L[:, self.ind_tril[0], self.ind_tril[1]] = L_vector
+        return mean, L
 
     def loss(self, Y_pred, Y):
-        mean_pred, var_pred = Y_pred
-        mean, var = Y
-        return torch.mean(self.loss_function(mean_pred, var_pred, mean, var))
+        return torch.mean(self.loss_function(Y_pred, Y))
 
     @torch.no_grad()
     def predict(self, dataset, batch_size=2048):
         dataloader = DataLoader(dataset, batch_size=batch_size)
         output = [self(X_batch, auxiliary_batch) for X_batch, auxiliary_batch, _ in dataloader]
-        mean, var = list(zip(*output))
-        mean, var = torch.concat(mean), torch.concat(var)
-        return mean, var
+        mean, L = list(zip(*output))
+        mean, L = torch.concat(mean), torch.concat(L)
+        return mean, L
 
     def evaluate(self, Y_pred, dataset):
-        mean, var = Y_pred
-        mean, var = mean.cpu().numpy(), var.cpu().numpy()
-        std = np.sqrt(var)
-        quartiles_pred = np.stack([norm.ppf(quartile, loc=mean, scale=std) for quartile in QUARTILES])
+        mean, L = Y_pred
+        mean, L = mean.cpu(), L.cpu()
+        sample = distributions.MultivariateNormal(mean, scale_tril=L).sample((T, ))
+        quartiles_pred = np.quantile(sample.numpy(), QUARTILES, axis=0)
         return light_score(dataset.quartiles, quartiles_pred)
 
 
@@ -269,12 +279,11 @@ class SpectraDataset(Dataset):
         self.auxiliary = standardise(auxiliary, self.auxiliary_train_mean, self.auxiliary_train_std)
         self.Y = Y
         self.quartiles = quartiles
-        if torch.cuda.is_available():
-            self.X_orig = self.X_orig.cuda()
-            self.X = self.X.cuda()
-            self.noise = self.noise.cuda()
-            self.auxiliary = self.auxiliary.cuda()
-            self.Y = (self.Y[0].cuda(), self.Y[1].cuda())
+        self.X_orig = self.X_orig.to(DEVICE)
+        self.X = self.X.to(DEVICE)
+        self.noise = self.noise.to(DEVICE)
+        self.auxiliary = self.auxiliary.to(DEVICE)
+        self.Y = (self.Y[0].to(DEVICE), self.Y[1].to(DEVICE))
 
     def __len__(self):
         return self.X.shape[0]
@@ -319,20 +328,20 @@ def train(Model, config, data_train, data_valid=None):
                 optimiser.step()
             model.eval()
             output_train = model.predict(trainset)
-            loss_train = model.loss(output_train, trainset.Y).item()
-            score_train = model.evaluate(output_train, trainset)
-            wandb.log({"loss_train": loss_train, "light_score_train": score_train})
+            log = dict()
+            log["loss_train"] = model.loss(output_train, trainset.Y).item()
+            log["light_score_train"] = model.evaluate(output_train, trainset)
             if data_valid is not None:
                 output_valid = model.predict(validset)
-                loss_valid = model.loss(output_valid, validset.Y).item()
-                score_valid = model.evaluate(output_valid, validset)
-                wandb.log({"loss_valid": loss_valid, "light_score_valid": score_valid})
+                log["loss_valid"] = model.loss(output_valid, validset.Y).item()
+                log["light_score_valid"] = model.evaluate(output_valid, validset)
+            wandb.log(log)
         torch.save(model.state_dict(), f"models/{wandb.run.name}.pt")
         return model
 
 
 if __name__ == "__main__":
-    ids_train = np.arange(N)
+    ids_train = np.arange(N_ANNOTATED)
     ids_valid = None
     # validset
     ids_train, ids_valid = train_test_split(ids_train, train_size=0.8, random_state=36)
