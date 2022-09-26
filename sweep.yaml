@@ -14,10 +14,10 @@ parameters:
         distribution: log_uniform_values
         min: 1e-6
         max: 1e-2
-    loss:
-        value: "kl_divergence"
-        #distribution: categorical
-        #values: ["crps", "kl_divergence", "nll"]
+    n_epochs:
+        values: [64, 128, 256, 512, 1024, 2048]
+    n_epochs_pretrain:
+        values: [64, 128, 256, 512, 1024, 2048]
     n_hiddens:
         distribution: int_uniform
         min: 1

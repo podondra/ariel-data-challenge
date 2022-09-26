@@ -10,6 +10,7 @@ import torch
 from torch import distributions
 from torch import nn
 from torch import optim
+from torch.distributions.multivariate_normal import _batch_mahalanobis
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -19,13 +20,13 @@ import wandb
 DEFAULT_PRIOR_BOUNDS = np.array([[0, -12, -12, -12, -12, -12], [3000, -2, -2, -2, -2, -2]])
 DEFAULT_HYPERPARAMETERS = dict(
         batch_size=256,
-        dropout_probability=0.0,
+        dropout_probability=0.2,
         learning_rate=0.0001,
-        loss="kl_divergence",
+        n_epochs=1024,
+        n_epochs_pretrain=1024,
         n_hiddens=5,
         n_neurons=1024,
-        noisy_spectra=False,
-        n_epochs=2048)
+        noisy_spectra=False)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 N = 91392
 N_ANNOTATED = 21988
@@ -71,7 +72,7 @@ def read_auxiliary_table(ids, path="data/train/auxiliary_table.csv"):
 
 def read_fm_parameter_table(ids, path="data/train/ground_truth/fm_parameter_table.csv"):
     fm_parameter = pd.read_csv(path, index_col="planet_ID")
-    return torch.from_numpy(fm_parameter.loc[ids].values)
+    return torch.from_numpy(fm_parameter.loc[ids].values).float()
 
 
 def read_quartiles_table(ids, path="data/train/ground_truth/quartiles_table.csv"):
@@ -142,8 +143,12 @@ def regular_track_format(traces, weights=None, filename="data/regular_track.hdf5
             grp.create_dataset("weights", data=weight)
 
 
-def nll(mean_pred, var_pred, mean, var):
-    return 0.5 * torch.log(var_pred) + 0.5 * (mean - mean_pred).square() / var_pred
+def nll(Y_pred, Y):
+    mean_pred, L_pred = Y_pred
+    mean, _ = Y
+    mean_difference = (mean - mean_pred)
+    return (torch.sum(torch.log(L_pred.diagonal(dim1=-2, dim2=-1)), dim=-1)
+            + 0.5 * _batch_mahalanobis(L_pred, mean_difference))
 
 
 def kl_divergence(Y_pred, Y):
@@ -155,6 +160,7 @@ def kl_divergence(Y_pred, Y):
 
 
 def crps(mean_pred, var_pred, mean, var):
+    # TODO can be applied to covariance matrix?
     std_pred = torch.sqrt(var_pred)
     mean_std = (mean - mean_pred) / std_pred
     pi = torch.tensor(np.pi)
@@ -207,13 +213,12 @@ class Model(nn.Module):
             self.add_module("dropout" + str(i), self.dropouts[-1])
         self.output = nn.Linear(self.n_neurons, N_TARGETS + N_TARGETS * (N_TARGETS + 1) // 2)
         self.to(DEVICE)
-        losses = {
-            "crps": crps,
-            "kl_divergence": kl_divergence,
-            "nll": nll}
-        self.loss_function = losses[config["loss"]]
+        self.loss_function = kl_divergence
         self.ind_diag = torch.arange(N_TARGETS)
         self.ind_tril = torch.tril_indices(row=N_TARGETS, col=N_TARGETS, offset=-1)
+
+    def pretrain(self, flag):
+        self.loss_function = nll if flag else kl_divergence
 
     def forward(self, X, auxiliary):
         X = torch.unsqueeze(X, 1)
@@ -263,12 +268,13 @@ def scale(X):
 
 class SpectraDataset(Dataset):
     def __init__(
-            self, ids, X, noise, auxiliary, Y, quartiles,
+            self, ids, X, noise, auxiliary, mean, covariance=None, quartiles=None,
             auxiliary_train_mean=None, auxiliary_train_std=None):
         self.ids = ids
         self.X_orig = X
-        self.X = scale(self.X_orig)
-        self.noise = noise
+        self.X = scale(self.X_orig).to(DEVICE)
+        self.X_orig = self.X_orig.to(DEVICE)
+        self.noise = noise.to(DEVICE)
         self.auxiliary_train_mean = auxiliary_train_mean
         if self.auxiliary_train_mean is None:
             self.auxiliary_train_mean = auxiliary.mean(dim=0)
@@ -276,19 +282,19 @@ class SpectraDataset(Dataset):
         if self.auxiliary_train_std is None:
             self.auxiliary_train_std = auxiliary.std(dim=0)
         self.auxiliary = standardise(auxiliary, self.auxiliary_train_mean, self.auxiliary_train_std)
-        self.Y = Y
-        self.quartiles = quartiles
-        self.X_orig = self.X_orig.to(DEVICE)
-        self.X = self.X.to(DEVICE)
-        self.noise = self.noise.to(DEVICE)
         self.auxiliary = self.auxiliary.to(DEVICE)
-        self.Y = (self.Y[0].to(DEVICE), self.Y[1].to(DEVICE))
+        self.mean = mean.to(DEVICE)
+        if covariance is None:
+            self.covariance = torch.full((self.mean.shape[0], ), torch.nan, device=DEVICE)
+        else:
+            self.covariance = covariance.to(DEVICE)
+        self.quartiles = quartiles
 
     def __len__(self):
         return self.X.shape[0]
 
     def __getitem__(self, idx):
-        return self.X[idx], self.auxiliary[idx], (self.Y[0][idx], self.Y[1][idx])
+        return self.X[idx], self.auxiliary[idx], (self.mean[idx], self.covariance[idx])
 
 
 class NoisySpectraDataset(SpectraDataset):
@@ -296,54 +302,65 @@ class NoisySpectraDataset(SpectraDataset):
         self.X = scale(self.X_orig + torch.normal(mean=0.0, std=self.noise))
 
 
-def get_dataset(ids):
+def get_data(ids, pretrain=False):
     spectra = read_spectra(ids)
-    X, noise = spectra[1], spectra[2]
-    auxiliary = read_auxiliary_table(ids)
-    quartiles = read_quartiles_table(ids)
-    Y = read_traces(ids)
-    return ids, X, noise, auxiliary, Y, quartiles
+    data = {"ids": ids, "X": spectra[1], "noise": spectra[2], "auxiliary": read_auxiliary_table(ids)}
+    if pretrain:
+        data["mean"] = read_fm_parameter_table(ids)
+    else:
+        data["mean"], data["covariance"] = read_traces(ids)
+        data["quartiles"] = read_quartiles_table(ids)
+    return data
 
 
-def train(Model, config, data_train, data_valid=None):
-    with wandb.init(config=config, project="ariel-data-challenge"):
-        config = wandb.config
-        model = Model(config)
-        trainset = NoisySpectraDataset(*data_train)
-        trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
-        if data_valid is not None:
-            validset = SpectraDataset(
-                    *data_valid, trainset.auxiliary_train_mean, trainset.auxiliary_train_std)
-        optimiser = optim.Adam(model.parameters(), lr=config["learning_rate"])
-        for epoch in range(config["n_epochs"]):
-            model.train()
-            if config["noisy_spectra"]:
-                trainset.sample()
-                trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
-            for X_batch, auxiliary_batch, Y_batch in trainloader:
-                optimiser.zero_grad()
-                loss = model.loss(model(X_batch, auxiliary_batch), Y_batch)
-                loss.backward()
-                optimiser.step()
-            model.eval()
-            output_train = model.predict(trainset)
-            log = dict()
-            log["loss_train"] = model.loss(output_train, trainset.Y).item()
+def train(model, config, n_epochs, data_train, data_valid=None):
+    trainset = NoisySpectraDataset(**data_train)
+    trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
+    if data_valid is not None:
+        validset = SpectraDataset(
+                **data_valid,
+                auxiliary_train_mean=trainset.auxiliary_train_mean,
+                auxiliary_train_std=trainset.auxiliary_train_std)
+    optimiser = optim.Adam(model.parameters(), lr=config["learning_rate"])
+    for epoch in range(n_epochs):
+        model.train()
+        if config["noisy_spectra"]:
+            trainset.sample()
+            trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
+        for X_batch, auxiliary_batch, Y_batch in trainloader:
+            optimiser.zero_grad()
+            loss = model.loss(model(X_batch, auxiliary_batch), Y_batch)
+            loss.backward()
+            optimiser.step()
+        model.eval()
+        output_train = model.predict(trainset)
+        log = dict()
+        log["loss_train"] = model.loss(output_train, (trainset.mean, trainset.covariance)).item()
+        if trainset.quartiles is not None:
             log["light_score_train"] = model.evaluate(output_train, trainset)
-            if data_valid is not None:
-                output_valid = model.predict(validset)
-                log["loss_valid"] = model.loss(output_valid, validset.Y).item()
-                log["light_score_valid"] = model.evaluate(output_valid, validset)
-            wandb.log(log)
-        torch.save(model.state_dict(), f"models/{wandb.run.name}.pt")
-        return model
+        if data_valid is not None:
+            output_valid = model.predict(validset)
+            log["loss_valid"] = model.loss(output_valid, (validset.mean, validset.covariance)).item()
+            log["light_score_valid"] = model.evaluate(output_valid, validset)
+        wandb.log(log)
+    return model
 
 
 if __name__ == "__main__":
+    ids_pretrain = np.arange(N_ANNOTATED, N)
     ids_train = np.arange(N_ANNOTATED)
     ids_valid = None
-    # validset
     ids_train, ids_valid = train_test_split(ids_train, train_size=0.8, random_state=36)
-    data_train = get_dataset(ids_train)
-    data_valid = get_dataset(ids_valid) if ids_valid is not None else None
-    model = train(Model, DEFAULT_HYPERPARAMETERS, data_train, data_valid)
+    data_pretrain = get_data(ids_pretrain, pretrain=True)
+    data_train = get_data(ids_train)
+    data_valid = get_data(ids_valid) if ids_valid is not None else None
+
+    config = DEFAULT_HYPERPARAMETERS
+    with wandb.init(config=config, project="ariel-data-challenge"):
+        config = wandb.config
+        model = Model(config)
+        model.pretrain(True)
+        model = train(model, config, config["n_epochs_pretrain"], data_pretrain, data_valid)
+        model.pretrain(False)
+        model = train(model, config, config["n_epochs"], data_train, data_valid)
+        torch.save(model.state_dict(), f"models/{wandb.run.name}.pt")
