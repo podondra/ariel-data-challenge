@@ -4,7 +4,6 @@ import h5py
 import numpy as np
 import ot
 import pandas as pd
-from scipy.stats import norm
 from sklearn.model_selection import train_test_split
 import torch
 from torch import distributions
@@ -22,8 +21,8 @@ DEFAULT_HYPERPARAMETERS = dict(
         batch_size=256,
         dropout_probability=0.2,
         learning_rate=0.0001,
-        n_epochs=1024,
-        n_epochs_pretrain=1024,
+        n_epochs=2048,
+        n_epochs_pretrain=150,
         n_hiddens=5,
         n_neurons=1024,
         noisy_spectra=False)
@@ -53,16 +52,16 @@ def read_spectra(ids, path="data/train/spectra.hdf5"):
 def read_traces(ids, path="data/train/ground_truth/traces.hdf5"):
     n = ids.shape[0]
     with h5py.File(path, "r") as file:
-        means = torch.zeros((n, N_TARGETS))
-        covariances = torch.zeros((n, N_TARGETS, N_TARGETS))
+        Y = torch.zeros((n, N_TARGETS))
+        covariance = torch.zeros((n, N_TARGETS, N_TARGETS))
         for i, identifier in enumerate(ids):
             key = "Planet_" + str(identifier)
             trace = file[key]["tracedata"][:]
             weights = file[key]["weights"][:]
             mean = trace.T @ weights
-            means[i] = torch.from_numpy(mean)
-            covariances[i] = torch.from_numpy((weights * (trace - mean).T @ (trace - mean)))
-    return means, covariances
+            Y[i] = torch.from_numpy(mean)
+            covariance[i] = torch.from_numpy((weights * (trace - mean).T @ (trace - mean)))
+    return Y, covariance
 
 
 def read_auxiliary_table(ids, path="data/train/auxiliary_table.csv"):
@@ -146,9 +145,8 @@ def regular_track_format(traces, weights=None, filename="data/regular_track.hdf5
 def nll(Y_pred, Y):
     mean_pred, L_pred = Y_pred
     mean, _ = Y
-    mean_difference = (mean - mean_pred)
     return (torch.sum(torch.log(L_pred.diagonal(dim1=-2, dim2=-1)), dim=-1)
-            + 0.5 * _batch_mahalanobis(L_pred, mean_difference))
+            + 0.5 * _batch_mahalanobis(L_pred, mean - mean_pred))
 
 
 def kl_divergence(Y_pred, Y):
@@ -172,34 +170,24 @@ def crps(mean_pred, var_pred, mean, var):
 class Model(nn.Module):
     def __init__(self, config):
         super(Model, self).__init__()
+        # TODO reduce CNN to VGG Net-A
         self.cnn = nn.Sequential(
-                nn.Conv1d(1, 8, 3, padding="same", bias=False),
-                nn.BatchNorm1d(8),
-                nn.ReLU(),
+                nn.Conv1d(1, 8, 3, padding="same", bias=False), nn.BatchNorm1d(8), nn.ReLU(),
+                nn.Conv1d(8, 8, 3, padding="same", bias=False), nn.BatchNorm1d(8), nn.ReLU(),
                 nn.MaxPool1d(2),
-                nn.Conv1d(8, 16, 3, padding="same", bias=False),
-                nn.BatchNorm1d(16),
-                nn.ReLU(),
+                nn.Conv1d(8, 16, 3, padding="same", bias=False), nn.BatchNorm1d(16), nn.ReLU(),
+                nn.Conv1d(16, 16, 3, padding="same", bias=False), nn.BatchNorm1d(16), nn.ReLU(),
                 nn.MaxPool1d(2),
-                nn.Conv1d(16, 32, 3, padding="same", bias=False),
-                nn.BatchNorm1d(32),
-                nn.ReLU(),
-                nn.Conv1d(32, 32, 3, padding="same", bias=False),
-                nn.BatchNorm1d(32),
-                nn.ReLU(),
+                nn.Conv1d(16, 32, 3, padding="same", bias=False), nn.BatchNorm1d(32), nn.ReLU(),
+                nn.Conv1d(32, 32, 3, padding="same", bias=False), nn.BatchNorm1d(32), nn.ReLU(),
                 nn.MaxPool1d(2),
-                nn.Conv1d(32, 64, 3, padding="same", bias=False),
-                nn.BatchNorm1d(64),
-                nn.ReLU(),
-                nn.Conv1d(64, 64, 3, padding="same", bias=False),
-                nn.BatchNorm1d(64),
-                nn.ReLU(),
+                nn.Conv1d(32, 64, 3, padding="same", bias=False), nn.BatchNorm1d(64), nn.ReLU(),
+                nn.Conv1d(64, 64, 3, padding="same", bias=False), nn.BatchNorm1d(64), nn.ReLU(),
                 nn.MaxPool1d(2))
         self.n_neurons = config["n_neurons"]
         self.n_hiddens = config["n_hiddens"]
-        self.p = config["dropout_probability"]
         self.linear0 = nn.Linear(201, self.n_neurons, bias=False)
-        self.dropout0 = nn.Dropout(self.p)
+        self.dropout0 = nn.Dropout(config["dropout_probability"])
         self.batchnorm0 = nn.BatchNorm1d(self.n_neurons)
         self.linears = []
         self.dropouts = []
@@ -209,7 +197,7 @@ class Model(nn.Module):
             self.add_module("linear" + str(i), self.linears[-1])
             self.batchnorms.append(nn.BatchNorm1d(self.n_neurons))
             self.add_module("batchnorm" + str(i), self.batchnorms[-1])
-            self.dropouts.append(nn.Dropout(self.p))
+            self.dropouts.append(nn.Dropout(config["dropout_probability"]))
             self.add_module("dropout" + str(i), self.dropouts[-1])
         self.output = nn.Linear(self.n_neurons, N_TARGETS + N_TARGETS * (N_TARGETS + 1) // 2)
         self.to(DEVICE)
@@ -268,24 +256,20 @@ def scale(X):
 
 class SpectraDataset(Dataset):
     def __init__(
-            self, ids, X, noise, auxiliary, mean, covariance=None, quartiles=None,
-            auxiliary_train_mean=None, auxiliary_train_std=None):
+            self, ids, X, noise, auxiliary, Y, covariance=None, quartiles=None,
+            auxiliary_mean=None, auxiliary_std=None):
         self.ids = ids
         self.X_orig = X
         self.X = scale(self.X_orig).to(DEVICE)
         self.X_orig = self.X_orig.to(DEVICE)
         self.noise = noise.to(DEVICE)
-        self.auxiliary_train_mean = auxiliary_train_mean
-        if self.auxiliary_train_mean is None:
-            self.auxiliary_train_mean = auxiliary.mean(dim=0)
-        self.auxiliary_train_std = auxiliary_train_std
-        if self.auxiliary_train_std is None:
-            self.auxiliary_train_std = auxiliary.std(dim=0)
-        self.auxiliary = standardise(auxiliary, self.auxiliary_train_mean, self.auxiliary_train_std)
+        self.auxiliary_mean = auxiliary.mean(dim=0) if auxiliary_mean is None else auxiliary_mean
+        self.auxiliary_std = auxiliary.std(dim=0) if auxiliary_std is None else auxiliary_std
+        self.auxiliary = standardise(auxiliary, self.auxiliary_mean, self.auxiliary_std)
         self.auxiliary = self.auxiliary.to(DEVICE)
-        self.mean = mean.to(DEVICE)
+        self.Y = Y.to(DEVICE)
         if covariance is None:
-            self.covariance = torch.full((self.mean.shape[0], ), torch.nan, device=DEVICE)
+            self.covariance = torch.full((self.Y.shape[0], ), torch.nan, device=DEVICE)
         else:
             self.covariance = covariance.to(DEVICE)
         self.quartiles = quartiles
@@ -294,7 +278,7 @@ class SpectraDataset(Dataset):
         return self.X.shape[0]
 
     def __getitem__(self, idx):
-        return self.X[idx], self.auxiliary[idx], (self.mean[idx], self.covariance[idx])
+        return self.X[idx], self.auxiliary[idx], (self.Y[idx], self.covariance[idx])
 
 
 class NoisySpectraDataset(SpectraDataset):
@@ -306,27 +290,20 @@ def get_data(ids, pretrain=False):
     spectra = read_spectra(ids)
     data = {"ids": ids, "X": spectra[1], "noise": spectra[2], "auxiliary": read_auxiliary_table(ids)}
     if pretrain:
-        data["mean"] = read_fm_parameter_table(ids)
+        data["Y"] = read_fm_parameter_table(ids)
     else:
-        data["mean"], data["covariance"] = read_traces(ids)
+        data["Y"], data["covariance"] = read_traces(ids)
         data["quartiles"] = read_quartiles_table(ids)
     return data
 
 
-def train(model, config, n_epochs, data_train, data_valid=None):
-    trainset = NoisySpectraDataset(**data_train)
+def train(model, config, n_epochs, trainset, validset=None):
     trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
-    if data_valid is not None:
-        validset = SpectraDataset(
-                **data_valid,
-                auxiliary_train_mean=trainset.auxiliary_train_mean,
-                auxiliary_train_std=trainset.auxiliary_train_std)
     optimiser = optim.Adam(model.parameters(), lr=config["learning_rate"])
     for epoch in range(n_epochs):
         model.train()
         if config["noisy_spectra"]:
-            trainset.sample()
-            trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
+            trainloader = DataLoader(trainset.sample(), batch_size=config["batch_size"], shuffle=True)
         for X_batch, auxiliary_batch, Y_batch in trainloader:
             optimiser.zero_grad()
             loss = model.loss(model(X_batch, auxiliary_batch), Y_batch)
@@ -335,12 +312,12 @@ def train(model, config, n_epochs, data_train, data_valid=None):
         model.eval()
         output_train = model.predict(trainset)
         log = dict()
-        log["loss_train"] = model.loss(output_train, (trainset.mean, trainset.covariance)).item()
+        log["loss_train"] = model.loss(output_train, (trainset.Y, trainset.covariance)).item()
         if trainset.quartiles is not None:
             log["light_score_train"] = model.evaluate(output_train, trainset)
-        if data_valid is not None:
+        if validset is not None:
             output_valid = model.predict(validset)
-            log["loss_valid"] = model.loss(output_valid, (validset.mean, validset.covariance)).item()
+            log["loss_valid"] = model.loss(output_valid, (validset.Y, validset.covariance)).item()
             log["light_score_valid"] = model.evaluate(output_valid, validset)
         wandb.log(log)
     return model
@@ -348,19 +325,25 @@ def train(model, config, n_epochs, data_train, data_valid=None):
 
 if __name__ == "__main__":
     ids_pretrain = np.arange(N_ANNOTATED, N)
-    ids_train = np.arange(N_ANNOTATED)
-    ids_valid = None
-    ids_train, ids_valid = train_test_split(ids_train, train_size=0.8, random_state=36)
     data_pretrain = get_data(ids_pretrain, pretrain=True)
+    pretrainset = NoisySpectraDataset(**data_pretrain)
+    ids_train = np.arange(N_ANNOTATED)
+    ids_train, ids_valid = train_test_split(ids_train, train_size=0.8, random_state=36)
     data_train = get_data(ids_train)
-    data_valid = get_data(ids_valid) if ids_valid is not None else None
-
+    data_valid = get_data(ids_valid)
+    trainset = NoisySpectraDataset(
+            **data_train,
+            auxiliary_mean=pretrainset.auxiliary_mean, auxiliary_std=pretrainset.auxiliary_std)
+    validset = SpectraDataset(
+            **data_valid,
+            auxiliary_mean=pretrainset.auxiliary_mean, auxiliary_std=pretrainset.auxiliary_std)
     config = DEFAULT_HYPERPARAMETERS
     with wandb.init(config=config, project="ariel-data-challenge"):
         config = wandb.config
         model = Model(config)
         model.pretrain(True)
-        model = train(model, config, config["n_epochs_pretrain"], data_pretrain, data_valid)
+        # TODO pre-train with early stopping on trainset?
+        model = train(model, config, config["n_epochs_pretrain"], pretrainset, validset)
         model.pretrain(False)
-        model = train(model, config, config["n_epochs"], data_train, data_valid)
+        model = train(model, config, config["n_epochs"], trainset, validset)
         torch.save(model.state_dict(), f"models/{wandb.run.name}.pt")
