@@ -18,17 +18,21 @@ import wandb
 DEFAULT_PRIOR_BOUNDS = np.array([[0, -12, -12, -12, -12, -12], [3000, -2, -2, -2, -2, -2]])
 DEFAULT_HYPERPARAMETERS = dict(
         batch_size=256,
+        dropout_probability=0.0,
         learning_rate=0.0001,
         loss="kl_divergence",
         n_epochs=2048,
         n_hiddens=5,
         n_neurons=1024,
-        patience=2048)
-N = 21987
+        patience=1024)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+N = 91392
+N_ANNOTATED = 21987
 N_AUXILIARY = 9
 N_TARGETS = 6
 N_WAVES = 52
 QUARTILES = [0.16, 0.5, 0.84]
+T = 250
 
 
 def read_spectra(ids, path="data/train/spectra.hdf5"):
@@ -47,16 +51,16 @@ def read_spectra(ids, path="data/train/spectra.hdf5"):
 def read_traces(ids, path="data/train/ground_truth/traces.hdf5"):
     n = ids.shape[0]
     with h5py.File(path, "r") as file:
-        means = torch.zeros((n, 6))
-        variances = torch.zeros((n, 6))
+        Y = torch.zeros((n, N_TARGETS))
+        variance = torch.zeros((n, N_TARGETS))
         for i, identifier in enumerate(ids):
             key = "Planet_" + str(identifier)
             trace = file[key]["tracedata"][:]
             weights = file[key]["weights"][:]
             mean = trace.T @ weights
-            means[i] = torch.from_numpy(mean)
-            variances[i] = torch.from_numpy(np.square(trace - mean).T @ weights)
-    return means, variances
+            Y[i] = torch.from_numpy(mean)
+            variance[i] = torch.from_numpy(np.square(trace - mean).T @ weights)
+    return Y, variance
 
 
 def read_auxiliary_table(ids, path="data/train/auxiliary_table.csv"):
@@ -66,7 +70,7 @@ def read_auxiliary_table(ids, path="data/train/auxiliary_table.csv"):
 
 def read_fm_parameter_table(ids, path="data/train/ground_truth/fm_parameter_table.csv"):
     fm_parameter = pd.read_csv(path, index_col="planet_ID")
-    return torch.from_numpy(fm_parameter.loc[ids].values)
+    return torch.from_numpy(fm_parameter.loc[ids].values).float()
 
 
 def read_quartiles_table(ids, path="data/train/ground_truth/quartiles_table.csv"):
@@ -110,8 +114,7 @@ def wasserstein(trace1, trace2, w2, prior_bounds=DEFAULT_PRIOR_BOUNDS):
 
 
 def regular_score(traces_pred, ids, tracefile="data/train/ground_truth/traces.hdf5"):
-    # calculate the score for regular track from a predicted trace matrix (N X M X 6)
-    # and a ground truth HDF5 file
+    # calculate the score for regular track from a predicted trace matrix (N X T X 6)
     score = 0
     n = ids.shape[0]
     with h5py.File(tracefile, "r") as traces:
@@ -137,22 +140,106 @@ def regular_track_format(traces, weights=None, filename="data/regular_track.hdf5
             grp.create_dataset("weights", data=weight)
 
 
+def nll(mean_pred, variance_pred, mean, variance):
+    return 0.5 * (torch.log(variance_pred) + (mean - mean_pred).square() / variance_pred)
+
+
+def crps(mean_pred, variance_pred, mean, variance):
+    std_pred = torch.sqrt(variance_pred)
+    mean_std = (mean - mean_pred) / std_pred
+    pi = torch.tensor(np.pi)
+    pdf = (1.0 / torch.sqrt(2.0 * pi)) * torch.exp(-0.5 * torch.square(mean_std))
+    cdf = 0.5 + 0.5 * torch.erf(mean_std / torch.sqrt(torch.tensor(2.0)))
+    return std_pred * (mean_std * (2.0 * cdf - 1.0) + 2.0 * pdf - 1.0 / torch.sqrt(pi))
+
+
+def kl_divergence(mean_pred, variance_pred, mean, variance):
+    return (torch.log(torch.sqrt(variance_pred) / torch.sqrt(variance))
+            + 0.5 * (variance + torch.square(mean_pred - mean)) / variance_pred - 0.5)
+
+
+class Model(nn.Module):
+    def __init__(self, config):
+        super(Model, self).__init__()
+        self.cnn = nn.Sequential(
+                nn.Conv1d(1, 8, 3, padding="same"), nn.ReLU(),
+                nn.MaxPool1d(2),
+                nn.Conv1d(8, 16, 3, padding="same"), nn.ReLU(),
+                nn.MaxPool1d(2),
+                nn.Conv1d(16, 32, 3, padding="same"), nn.ReLU(),
+                nn.Conv1d(32, 32, 3, padding="same"), nn.ReLU(),
+                nn.MaxPool1d(2),
+                nn.Conv1d(32, 64, 3, padding="same"), nn.ReLU(),
+                nn.Conv1d(64, 64, 3, padding="same"), nn.ReLU(),
+                nn.MaxPool1d(2))
+        self.n_neurons = config["n_neurons"]
+        self.n_hiddens = config["n_hiddens"]
+        self.linear0 = nn.Linear(201, self.n_neurons)
+        self.dropout0 = nn.Dropout(config["dropout_probability"])
+        self.linears = []
+        self.dropouts = []
+        for i in range(1, self.n_hiddens + 1):
+            self.linears.append(nn.Linear(self.n_neurons, self.n_neurons))
+            self.add_module("linear" + str(i), self.linears[-1])
+            self.dropouts.append(nn.Dropout(config["dropout_probability"]))
+            self.add_module("dropout" + str(i), self.dropouts[-1])
+        self.output = nn.Linear(self.n_neurons, 2 * N_TARGETS)
+        self.to(DEVICE)
+        losses = {"crps": crps, "kl_divergence": kl_divergence, "nll": nll}
+        self.loss_function = losses[config["loss"]]
+
+    def forward(self, X, auxiliary):
+        X = torch.unsqueeze(X, 1)
+        X = self.cnn(X)
+        X = torch.flatten(X, start_dim=1)
+        X = torch.cat((X, auxiliary), dim=1)
+        X = F.relu(self.linear0(X))
+        X = self.dropout0(X)
+        for linear, dropout in zip(self.linears, self.dropouts):
+            X = F.relu(linear(X))
+            X = dropout(X)
+        X = self.output(X)
+        mean, variance = X[:, :N_TARGETS], X[:, N_TARGETS:]
+        variance = F.softplus(variance) + 1e-6
+        return mean, variance
+
+    def loss(self, Y_pred, Y):
+        return torch.mean(self.loss_function(*Y_pred, *Y))
+
+    @torch.no_grad()
+    def predict(self, dataset, batch_size=2048):
+        dataloader = DataLoader(dataset, batch_size=batch_size)
+        output = [self(X_batch, auxiliary_batch) for X_batch, auxiliary_batch, _ in dataloader]
+        mean, variance = list(zip(*output))
+        mean, variance = torch.concat(mean), torch.concat(variance)
+        return mean, variance
+
+    def evaluate(self, Y_pred, dataset):
+        mean, variance = Y_pred
+        mean, variance = mean.cpu().numpy(), variance.cpu().numpy()
+        std = np.sqrt(variance)
+        quartiles_pred = np.stack([norm.ppf(quartile, loc=mean, scale=std) for quartile in QUARTILES])
+        return light_score(dataset.quartiles, quartiles_pred)
+
+
 def standardise(tensor, mean, std):
     return (tensor - mean) / std
 
 
+def scale(tensor):
+        return (tensor - tensor.mean(dim=1, keepdim=True)) / tensor.std(dim=1, keepdim=True)
+
+
 class SpectraDataset(Dataset):
-    def __init__(self, ids, X, auxiliary, auxiliary_train_mean, auxiliary_train_std, Y, quartiles):
+    def __init__(self, ids, X, auxiliary, auxiliary_mean, auxiliary_std, Y, quartiles):
         self.ids = ids
-        self.X = (X - X.mean(dim=1, keepdim=True)) / X.std(dim=1, keepdim=True)
-        self.auxiliary = standardise(auxiliary, auxiliary_train_mean, auxiliary_train_std)
-        self.auxiliary_train_mean, self.auxiliary_train_std = auxiliary_train_mean, auxiliary_train_std
+        self.X = scale(X).to(DEVICE)
+        self.auxiliary_mean, self.auxiliary_std = auxiliary_mean, auxiliary_std
+        self.auxiliary = standardise(auxiliary, auxiliary_mean, auxiliary_std)
         self.Y = Y
         self.quartiles = quartiles
-        if torch.cuda.is_available():
-            self.X = self.X.cuda()
-            self.auxiliary = self.auxiliary.cuda()
-            self.Y = (self.Y[0].cuda(), self.Y[1].cuda())
+        self.auxiliary = self.auxiliary.to(DEVICE)
+        self.Y = (self.Y[0].to(DEVICE), self.Y[1].to(DEVICE))
 
     def __len__(self):
         return self.X.shape[0]
@@ -161,117 +248,20 @@ class SpectraDataset(Dataset):
         return self.X[idx], self.auxiliary[idx], (self.Y[0][idx], self.Y[1][idx])
 
 
-def nll(mean_pred, var_pred, mean, var):
-    return torch.mean(0.5 * torch.log(var_pred) + 0.5 * (mean - mean_pred).square() / var_pred)
+def get_dataset(ids, auxiliary_mean=None, auxiliary_std=None):
+    spectra = read_spectra(ids)
+    X, noise = spectra[1], spectra[2]
+    auxiliary = read_auxiliary_table(ids)
+    quartiles = read_quartiles_table(ids)
+    Y = read_traces(ids)
+    return SpectraDataset(
+            ids, X, auxiliary,
+            auxiliary.mean(dim=0) if auxiliary_mean is None else auxiliary_mean,
+            auxiliary.std(dim=0) if auxiliary_std is None else auxiliary_std,
+            Y, quartiles)
 
 
-def kl_divergence(mean_pred, var_pred, mean, var):
-    return (torch.log(torch.sqrt(var_pred) / torch.sqrt(var))
-            + 0.5 * (var + torch.square(mean_pred - mean)) / var_pred - 0.5)
-
-
-def crps(mean_pred, var_pred, mean, var):
-    std_pred = torch.sqrt(var_pred)
-    mean_std = (mean - mean_pred) / std_pred
-    pi = torch.tensor(np.pi)
-    pdf = (1.0 / torch.sqrt(2.0 * pi)) * torch.exp(-0.5 * torch.square(mean_std))
-    cdf = 0.5 + 0.5 * torch.erf(mean_std / torch.sqrt(torch.tensor(2.0)))
-    return std_pred * (mean_std * (2.0 * cdf - 1.0) + 2.0 * pdf - 1.0 / torch.sqrt(pi))
-
-
-class Model(nn.Module):
-    def __init__(self, config):
-        super(Model, self).__init__()
-        self.cnn = nn.Sequential(
-                nn.Conv1d(1, 8, 3, padding="same"),
-                nn.ReLU(),
-                nn.MaxPool1d(2),
-                nn.Conv1d(8, 16, 3, padding="same"),
-                nn.ReLU(),
-                nn.MaxPool1d(2),
-                nn.Conv1d(16, 32, 3, padding="same"),
-                nn.ReLU(),
-                nn.Conv1d(32, 32, 3, padding="same"),
-                nn.ReLU(),
-                nn.MaxPool1d(2),
-                nn.Conv1d(32, 64, 3, padding="same"),
-                nn.ReLU(),
-                nn.Conv1d(64, 64, 3, padding="same"),
-                nn.ReLU(),
-                nn.MaxPool1d(2))
-        self.n_neurons = config["n_neurons"]
-        self.n_hiddens = config["n_hiddens"]
-        self.input = nn.Linear(201, self.n_neurons)
-        self.linears = []
-        for i in range(1, self.n_hiddens + 1):
-            self.linears.append(nn.Linear(self.n_neurons, self.n_neurons))
-            self.add_module("linear" + str(i), self.linears[-1])
-        self.output = nn.Linear(self.n_neurons, 2 * N_TARGETS)
-        if torch.cuda.is_available():
-            self.cuda()
-        losses = {
-            "crps": crps,
-            "kl_divergence": kl_divergence,
-            "nll": nll}
-        self.loss_function = losses[config["loss"]]
-
-    def forward(self, X, auxiliary):
-        X = torch.unsqueeze(X, 1)
-        X = self.cnn(X)
-        X = torch.flatten(X, start_dim=1)
-        X = torch.cat((X, auxiliary), dim=1)
-        X = F.relu(self.input(X))
-        for linear in self.linears:
-            X = F.relu(linear(X))
-        X = self.output(X)
-        mean, var = X[:, :N_TARGETS], X[:, N_TARGETS:]
-        var = F.softplus(var) + 1e-6
-        return mean, var
-
-    def loss(self, Y_pred, Y):
-        mean_pred, var_pred = Y_pred
-        mean, var = Y
-        return torch.mean(self.loss_function(mean_pred, var_pred, mean, var))
-
-    @torch.no_grad()
-    def predict(self, dataset, batch_size=2048):
-        dataloader = DataLoader(dataset, batch_size=batch_size)
-        output = [self(X_batch, auxiliary_batch) for X_batch, auxiliary_batch, _ in dataloader]
-        mean, var = list(zip(*output))
-        mean, var = torch.concat(mean), torch.concat(var)
-        return mean, var
-
-    def evaluate(self, Y_pred, dataset):
-        mean, var = Y_pred
-        mean, var = mean.cpu().numpy(), var.cpu().numpy()
-        std = np.sqrt(var)
-        quartiles_pred = np.stack([norm.ppf(quartile, loc=mean, scale=std) for quartile in QUARTILES])
-        return light_score(dataset.quartiles, quartiles_pred)
-
-
-def train_epochs(Model, trainset, config):
-    with wandb.init(config=config, project="ariel-data-challenge"):
-        config = wandb.config
-        model = Model(config)
-        trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
-        optimiser = optim.Adam(model.parameters(), lr=config["learning_rate"])
-        for epoch in range(config["n_epochs"]):
-            model.train()
-            for X_batch, auxiliary_batch, Y_batch in trainloader:
-                optimiser.zero_grad()
-                loss = model.loss(model(X_batch, auxiliary_batch), Y_batch)
-                loss.backward()
-                optimiser.step()
-            model.eval()
-            output_train = model.predict(trainset)
-            loss_train = model.loss(output_train, trainset.Y).item()
-            score_train = model.evaluate(output_train, trainset)
-            wandb.log({"loss_train": loss_train, "light_score_train": score_train})
-        torch.save(model.state_dict(), f"models/{wandb.run.name}.pt")
-        return model
-
-
-def train(Model, trainset, validset, config):
+def train_early_stopping(Model, config, trainset, validset):
     with wandb.init(config=config, project="ariel-data-challenge"):
         config = wandb.config
         model = Model(config)
@@ -288,10 +278,10 @@ def train(Model, trainset, validset, config):
                 optimiser.step()
             model.eval()
             output_train = model.predict(trainset)
-            output_valid = model.predict(validset)
             loss_train = model.loss(output_train, trainset.Y).item()
-            loss_valid = model.loss(output_valid, validset.Y).item()
             score_train = model.evaluate(output_train, trainset)
+            output_valid = model.predict(validset)
+            loss_valid = model.loss(output_valid, validset.Y).item()
             score_valid = model.evaluate(output_valid, validset)
             if score_valid > score_valid_best:
                 i = 0
@@ -317,29 +307,37 @@ def train(Model, trainset, validset, config):
         return model
 
 
-def get_dataset(ids, auxiliary_train_mean=None, auxiliary_train_std=None):
-    spectra = read_spectra(ids)
-    X, noise = spectra[1], spectra[2]
-    auxiliary = read_auxiliary_table(ids)
-    quartiles = read_quartiles_table(ids)
-    Y = read_traces(ids)
-    return SpectraDataset(
-            ids,
-            X,
-            auxiliary,
-            auxiliary.mean(dim=0) if auxiliary_train_mean is None else auxiliary_train_mean,
-            auxiliary.std(dim=0) if auxiliary_train_std is None else auxiliary_train_std,
-            Y,
-            quartiles)
+def train_epochs(Model, config, trainset, validset=None):
+    with wandb.init(config=config, project="ariel-data-challenge"):
+        config = wandb.config
+        model = Model(config)
+        trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
+        optimiser = optim.Adam(model.parameters(), lr=config["learning_rate"])
+        for epoch in range(config["n_epochs"]):
+            model.train()
+            for X_batch, auxiliary_batch, Y_batch in trainloader:
+                optimiser.zero_grad()
+                loss = model.loss(model(X_batch, auxiliary_batch), Y_batch)
+                loss.backward()
+                optimiser.step()
+            model.eval()
+            output_train = model.predict(trainset)
+            log = dict()
+            log["loss_train"] = model.loss(output_train, trainset.Y).item()
+            log["light_score_train"] = model.evaluate(output_train, trainset)
+            if validset is not None:
+                output_valid = model.predict(validset)
+                log["loss_valid"] = model.loss(output_valid, validset.Y).item()
+                log["light_score_valid"] = model.evaluate(output_valid, validset)
+            wandb.log(log)
+        torch.save(model.state_dict(), f"models/{wandb.run.name}.pt")
+        return model
 
 
 if __name__ == "__main__":
     # train and validation set split
-    #ids = np.arange(N)
-    #ids_train, ids_valid = train_test_split(ids, train_size=0.8, random_state=36)
-    #trainset = get_dataset(ids_train)
-    #validset = get_dataset(ids_valid, trainset.auxiliary_train_mean, trainset.auxiliary_train_std)
-    #model = train(Model, trainset, validset, DEFAULT_HYPERPARAMETERS)
-    ids_train = np.arange(N)
+    ids_train = np.arange(N_ANNOTATED)
+    ids_train, ids_valid = train_test_split(ids_train, train_size=0.8, random_state=36)
     trainset = get_dataset(ids_train)
-    model = train_epochs(Model, trainset, DEFAULT_HYPERPARAMETERS)
+    validset = get_dataset(ids_valid, trainset.auxiliary_mean, trainset.auxiliary_std)
+    model = train_early_stopping(Model, DEFAULT_HYPERPARAMETERS, trainset, validset)
