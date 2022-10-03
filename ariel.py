@@ -27,12 +27,12 @@ DEFAULT_HYPERPARAMETERS = dict(
         patience=1024)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 N = 91392
-N_ANNOTATED = 21987
+N_ANNOTATED = 21988
 N_AUXILIARY = 9
 N_TARGETS = 6
+N_TEST = 800
 N_WAVES = 52
 QUARTILES = [0.16, 0.5, 0.84]
-T = 250
 
 
 def read_spectra(ids, path="data/train/spectra.hdf5"):
@@ -337,7 +337,8 @@ def train_epochs(Model, config, trainset, validset=None):
 if __name__ == "__main__":
     # train and validation set split
     ids_train = np.arange(N_ANNOTATED)
-    ids_train, ids_valid = train_test_split(ids_train, train_size=0.8, random_state=36)
+    # TODO ids_train, ids_valid = train_test_split(ids_train, train_size=0.8, random_state=36)
     trainset = get_dataset(ids_train)
-    validset = get_dataset(ids_valid, trainset.auxiliary_mean, trainset.auxiliary_std)
-    model = train_early_stopping(Model, DEFAULT_HYPERPARAMETERS, trainset, validset)
+    # TODO validset = get_dataset(ids_valid, trainset.auxiliary_mean, trainset.auxiliary_std)
+    # TODO model = train_early_stopping(Model, DEFAULT_HYPERPARAMETERS, trainset, validset)
+    model = train_epochs(Model, DEFAULT_HYPERPARAMETERS, trainset)
