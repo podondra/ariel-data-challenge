@@ -1,21 +1,21 @@
 program: ariel.py
 method: random
 metric:
-    name: light_score_valid_best
-    goal: maximize
+    name: loss_valid
+    goal: minimize
 parameters:
     batch_size:
         value: 256
     dropout_probability:
-        distribution: uniform
-        min: 0.0
-        max: 0.5
+        value: 0.0
     learning_rate:
-        distribution: log_uniform_values
-        min: 1e-6
-        max: 1e-1
+        value: 0.0001
     loss:
         value: "kl_divergence"
+    loss_pretrain:
+        values: ["crps", "nll"]
+    n_epochs:
+        values: [1024, 2048, 4096]
     n_hiddens:
         distribution: int_uniform
         min: 1
@@ -23,4 +23,4 @@ parameters:
     n_neurons:
         values: [128, 256, 512, 1024, 2048, 4096]
     patience:
-        value: 1024
+        value: 128

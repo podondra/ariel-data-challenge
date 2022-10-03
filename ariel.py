@@ -21,10 +21,11 @@ DEFAULT_HYPERPARAMETERS = dict(
         dropout_probability=0.0,
         learning_rate=0.0001,
         loss="kl_divergence",
-        n_epochs=2048,
-        n_hiddens=5,
-        n_neurons=1024,
-        patience=1024)
+        loss_pretrain="crps",
+        n_epochs=1024,
+        n_hiddens=4,
+        n_neurons=512,
+        patience=128)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 N = 91392
 N_ANNOTATED = 21988
@@ -185,8 +186,14 @@ class Model(nn.Module):
             self.add_module("dropout" + str(i), self.dropouts[-1])
         self.output = nn.Linear(self.n_neurons, 2 * N_TARGETS)
         self.to(DEVICE)
-        losses = {"crps": crps, "kl_divergence": kl_divergence, "nll": nll}
-        self.loss_function = losses[config["loss"]]
+        self.losses = {"crps": crps, "kl_divergence": kl_divergence, "nll": nll}
+        self.loss_function = self.losses[config["loss"]]
+
+    def pretrain(self, flag):
+        if flag:
+            self.loss_function = self.losses[config["loss_pretrain"]]
+        else:
+            self.loss_function = self.losses[config["loss"]]
 
     def forward(self, X, auxiliary):
         X = torch.unsqueeze(X, 1)
@@ -204,7 +211,9 @@ class Model(nn.Module):
         return mean, variance
 
     def loss(self, Y_pred, Y):
-        return torch.mean(self.loss_function(*Y_pred, *Y))
+        mean_pred, variance_pred = Y_pred
+        mean, variance = Y
+        return torch.mean(self.loss_function(mean_pred, variance_pred, mean, variance))
 
     @torch.no_grad()
     def predict(self, dataset, batch_size=2048):
@@ -227,118 +236,122 @@ def standardise(tensor, mean, std):
 
 
 def scale(tensor):
-        return (tensor - tensor.mean(dim=1, keepdim=True)) / tensor.std(dim=1, keepdim=True)
+    return (tensor - tensor.mean(dim=1, keepdim=True)) / tensor.std(dim=1, keepdim=True)
 
 
 class SpectraDataset(Dataset):
-    def __init__(self, ids, X, auxiliary, auxiliary_mean, auxiliary_std, Y, quartiles):
+    def __init__(self, ids, X, auxiliary, auxiliary_mean, auxiliary_std, Y, variance, quartiles):
         self.ids = ids
         self.X = scale(X).to(DEVICE)
         self.auxiliary_mean, self.auxiliary_std = auxiliary_mean, auxiliary_std
-        self.auxiliary = standardise(auxiliary, auxiliary_mean, auxiliary_std)
-        self.Y = Y
+        self.auxiliary = standardise(auxiliary, auxiliary_mean, auxiliary_std).to(DEVICE)
+        self.Y = Y.to(DEVICE)
+        if variance is None:
+            self.variance = torch.full_like(self.Y, torch.nan, device=DEVICE)
+        else:
+            self.variance = variance.to(DEVICE)
         self.quartiles = quartiles
-        self.auxiliary = self.auxiliary.to(DEVICE)
-        self.Y = (self.Y[0].to(DEVICE), self.Y[1].to(DEVICE))
 
     def __len__(self):
         return self.X.shape[0]
 
     def __getitem__(self, idx):
-        return self.X[idx], self.auxiliary[idx], (self.Y[0][idx], self.Y[1][idx])
+        return self.X[idx], self.auxiliary[idx], (self.Y[idx], self.variance[idx])
 
 
-def get_dataset(ids, auxiliary_mean=None, auxiliary_std=None):
+def get_dataset(ids, auxiliary_mean=None, auxiliary_std=None, pretrain=False):
     spectra = read_spectra(ids)
     X, noise = spectra[1], spectra[2]
     auxiliary = read_auxiliary_table(ids)
-    quartiles = read_quartiles_table(ids)
-    Y = read_traces(ids)
+    if pretrain:
+        Y, variance = read_fm_parameter_table(ids), None
+        quartiles = None
+    else:
+        Y, variance = read_traces(ids)
+        quartiles = read_quartiles_table(ids)
     return SpectraDataset(
             ids, X, auxiliary,
             auxiliary.mean(dim=0) if auxiliary_mean is None else auxiliary_mean,
             auxiliary.std(dim=0) if auxiliary_std is None else auxiliary_std,
-            Y, quartiles)
+            Y, variance, quartiles)
 
 
-def train_early_stopping(Model, config, trainset, validset):
-    with wandb.init(config=config, project="ariel-data-challenge"):
-        config = wandb.config
-        model = Model(config)
-        trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
-        optimiser = optim.Adam(model.parameters(), lr=config["learning_rate"])
-        score_valid_best = float("-inf")
-        i = 0
-        while i < config["patience"]:
-            model.train()
-            for X_batch, auxiliary_batch, Y_batch in trainloader:
-                optimiser.zero_grad()
-                loss = model.loss(model(X_batch, auxiliary_batch), Y_batch)
-                loss.backward()
-                optimiser.step()
-            model.eval()
-            output_train = model.predict(trainset)
-            loss_train = model.loss(output_train, trainset.Y).item()
-            score_train = model.evaluate(output_train, trainset)
+def train_early_stopping(model, config, trainset, validset):
+    trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
+    optimiser = optim.Adam(model.parameters(), lr=config["learning_rate"])
+    loss_valid_best = float("inf")
+    i = 0
+    while i < config["patience"]:
+        model.train()
+        for X_batch, auxiliary_batch, Y_batch in trainloader:
+            optimiser.zero_grad()
+            loss = model.loss(model(X_batch, auxiliary_batch), Y_batch)
+            loss.backward()
+            optimiser.step()
+        model.eval()
+        output_train = model.predict(trainset)
+        output_valid = model.predict(validset)
+        loss_train = model.loss(output_train, (trainset.Y, trainset.variance)).item()
+        loss_valid = model.loss(output_valid, (validset.Y, validset.variance)).item()
+        score_valid = model.evaluate(output_valid, validset)
+        if loss_valid < loss_valid_best:
+            i = 0
+            loss_valid_best = loss_valid
+            score_valid_at_best = score_valid
+            loss_train_at_best = loss_train
+            model_state_at_best = deepcopy(model.state_dict())
+        else:
+            i += 1
+        wandb.log({
+            "loss_train": loss_train,
+            "loss_valid": loss_valid,
+            "light_score_valid": score_valid,
+            "loss_valid_best": loss_valid_best})
+        wandb.run.summary["loss_train"] = loss_train_at_best
+        wandb.run.summary["loss_valid"] = loss_valid_best
+        wandb.run.summary["light_score_valid"] = score_valid_at_best
+    model.load_state_dict(model_state_at_best)
+    return model
+
+
+def train_epochs(model, config, trainset, validset=None):
+    trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
+    optimiser = optim.Adam(model.parameters(), lr=config["learning_rate"])
+    for epoch in range(config["n_epochs"]):
+        model.train()
+        for X_batch, auxiliary_batch, Y_batch in trainloader:
+            optimiser.zero_grad()
+            loss = model.loss(model(X_batch, auxiliary_batch), Y_batch)
+            loss.backward()
+            optimiser.step()
+        model.eval()
+        output_train = model.predict(trainset)
+        log = dict()
+        log["loss_train"] = model.loss(output_train, (trainset.Y, trainset.variance)).item()
+        log["light_score_train"] = model.evaluate(output_train, trainset)
+        if validset is not None:
             output_valid = model.predict(validset)
-            loss_valid = model.loss(output_valid, validset.Y).item()
-            score_valid = model.evaluate(output_valid, validset)
-            if score_valid > score_valid_best:
-                i = 0
-                score_valid_best = score_valid
-                score_train_at_best = score_train
-                loss_train_at_best = loss_train
-                loss_valid_at_best = loss_valid
-                model_state_at_best = deepcopy(model.state_dict())
-                torch.save(model_state_at_best, f"models/{wandb.run.name}.pt")
-            else:
-                i += 1
-            wandb.log({
-                "loss_train": loss_train,
-                "loss_valid": loss_valid,
-                "light_score_train": score_train,
-                "light_score_valid": score_valid,
-                "light_score_valid_best": score_valid_best})
-            wandb.run.summary["loss_train"] = loss_train_at_best
-            wandb.run.summary["loss_valid"] = loss_valid_at_best
-            wandb.run.summary["light_score_train"] = score_train_at_best
-            wandb.run.summary["light_score_valid"] = score_valid_best
-        model.load_state_dict(model_state_at_best)
-        return model
-
-
-def train_epochs(Model, config, trainset, validset=None):
-    with wandb.init(config=config, project="ariel-data-challenge"):
-        config = wandb.config
-        model = Model(config)
-        trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
-        optimiser = optim.Adam(model.parameters(), lr=config["learning_rate"])
-        for epoch in range(config["n_epochs"]):
-            model.train()
-            for X_batch, auxiliary_batch, Y_batch in trainloader:
-                optimiser.zero_grad()
-                loss = model.loss(model(X_batch, auxiliary_batch), Y_batch)
-                loss.backward()
-                optimiser.step()
-            model.eval()
-            output_train = model.predict(trainset)
-            log = dict()
-            log["loss_train"] = model.loss(output_train, trainset.Y).item()
-            log["light_score_train"] = model.evaluate(output_train, trainset)
-            if validset is not None:
-                output_valid = model.predict(validset)
-                log["loss_valid"] = model.loss(output_valid, validset.Y).item()
-                log["light_score_valid"] = model.evaluate(output_valid, validset)
-            wandb.log(log)
-        torch.save(model.state_dict(), f"models/{wandb.run.name}.pt")
-        return model
+            log["loss_valid"] = model.loss(output_valid, (validset.Y, validset.variance)).item()
+            log["light_score_valid"] = model.evaluate(output_valid, validset)
+        wandb.log(log)
+    return model
 
 
 if __name__ == "__main__":
+    ids_pretrain = np.arange(N_ANNOTATED, N)
+    pretrainset = get_dataset(ids_pretrain, pretrain=True)
     # train and validation set split
     ids_train = np.arange(N_ANNOTATED)
-    # TODO ids_train, ids_valid = train_test_split(ids_train, train_size=0.8, random_state=36)
-    trainset = get_dataset(ids_train)
-    # TODO validset = get_dataset(ids_valid, trainset.auxiliary_mean, trainset.auxiliary_std)
-    # TODO model = train_early_stopping(Model, DEFAULT_HYPERPARAMETERS, trainset, validset)
-    model = train_epochs(Model, DEFAULT_HYPERPARAMETERS, trainset)
+    #ids_train, ids_valid = train_test_split(ids_train, train_size=0.8, random_state=36)
+    trainset = get_dataset(ids_train, pretrainset.auxiliary_mean, pretrainset.auxiliary_std)
+    #validset = get_dataset(ids_valid, pretrainset.auxiliary_mean, pretrainset.auxiliary_std)
+    validset = None
+    config = DEFAULT_HYPERPARAMETERS
+    with wandb.init(config=config, project="ariel-data-challenge"):
+        config = wandb.config
+        model = Model(config)
+        model.pretrain(True)
+        model = train_early_stopping(model, config, pretrainset, trainset)
+        model.pretrain(False)
+        model = train_epochs(model, config, trainset, validset)
+        torch.save(model.state_dict(), f"models/{wandb.run.name}.pt")
