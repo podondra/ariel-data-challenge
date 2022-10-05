@@ -18,14 +18,14 @@ import wandb
 DEFAULT_PRIOR_BOUNDS = np.array([[0, -12, -12, -12, -12, -12], [3000, -2, -2, -2, -2, -2]])
 DEFAULT_HYPERPARAMETERS = dict(
         batch_size=256,
-        dropout_probability=0.0,
+        dropout_probability=0.168,
         learning_rate=0.0001,
         loss="kl_divergence",
-        loss_pretrain="crps",
-        n_epochs=1024,
-        n_hiddens=4,
+        loss_pretrain=None,
+        n_epochs=2048,
+        n_hiddens=1,
         n_neurons=512,
-        patience=128)
+        patience=None)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 N = 91392
 N_ANNOTATED = 21988
@@ -163,28 +163,28 @@ class Model(nn.Module):
     def __init__(self, config):
         super(Model, self).__init__()
         self.cnn = nn.Sequential(
-                nn.Conv1d(1, 8, 3, padding="same"), nn.ReLU(),
+                nn.Conv1d(1, 8, 3, padding="same", bias=False), nn.BatchNorm1d(8), nn.ReLU(),
                 nn.MaxPool1d(2),
-                nn.Conv1d(8, 16, 3, padding="same"), nn.ReLU(),
+                nn.Conv1d(8, 16, 3, padding="same", bias=False), nn.BatchNorm1d(16), nn.ReLU(),
                 nn.MaxPool1d(2),
-                nn.Conv1d(16, 32, 3, padding="same"), nn.ReLU(),
-                nn.Conv1d(32, 32, 3, padding="same"), nn.ReLU(),
+                nn.Conv1d(16, 32, 3, padding="same", bias=False), nn.BatchNorm1d(32), nn.ReLU(),
                 nn.MaxPool1d(2),
-                nn.Conv1d(32, 64, 3, padding="same"), nn.ReLU(),
-                nn.Conv1d(64, 64, 3, padding="same"), nn.ReLU(),
+                nn.Conv1d(32, 64, 3, padding="same", bias=False), nn.BatchNorm1d(64), nn.ReLU(),
                 nn.MaxPool1d(2))
-        self.n_neurons = config["n_neurons"]
-        self.n_hiddens = config["n_hiddens"]
-        self.linear0 = nn.Linear(201, self.n_neurons)
+        self.linear0 = nn.Linear(201, config["n_neurons"], bias=False)
+        self.batchnorm0 = nn.BatchNorm1d(config["n_neurons"])
         self.dropout0 = nn.Dropout(config["dropout_probability"])
         self.linears = []
+        self.batchnorms = []
         self.dropouts = []
-        for i in range(1, self.n_hiddens + 1):
-            self.linears.append(nn.Linear(self.n_neurons, self.n_neurons))
+        for i in range(1, config["n_hiddens"] + 1):
+            self.linears.append(nn.Linear(config["n_neurons"], config["n_neurons"], bias=False))
             self.add_module("linear" + str(i), self.linears[-1])
+            self.batchnorms.append(nn.BatchNorm1d(config["n_neurons"]))
+            self.add_module("batchnorm" + str(i), self.batchnorms[-1])
             self.dropouts.append(nn.Dropout(config["dropout_probability"]))
             self.add_module("dropout" + str(i), self.dropouts[-1])
-        self.output = nn.Linear(self.n_neurons, 2 * N_TARGETS)
+        self.output = nn.Linear(config["n_neurons"], 2 * N_TARGETS)
         self.to(DEVICE)
         self.losses = {"crps": crps, "kl_divergence": kl_divergence, "nll": nll}
         self.loss_function = self.losses[config["loss"]]
@@ -200,10 +200,10 @@ class Model(nn.Module):
         X = self.cnn(X)
         X = torch.flatten(X, start_dim=1)
         X = torch.cat((X, auxiliary), dim=1)
-        X = F.relu(self.linear0(X))
+        X = F.relu(self.batchnorm0(self.linear0(X)))
         X = self.dropout0(X)
-        for linear, dropout in zip(self.linears, self.dropouts):
-            X = F.relu(linear(X))
+        for linear, batchnorm, dropout in zip(self.linears, self.batchnorms, self.dropouts):
+            X = F.relu(batchnorm(linear(X)))
             X = dropout(X)
         X = self.output(X)
         mean, variance = X[:, :N_TARGETS], X[:, N_TARGETS:]
@@ -338,20 +338,20 @@ def train_epochs(model, config, trainset, validset=None):
 
 
 if __name__ == "__main__":
-    ids_pretrain = np.arange(N_ANNOTATED, N)
-    pretrainset = get_dataset(ids_pretrain, pretrain=True)
+    #ids_pretrain = np.arange(N_ANNOTATED, N)
+    #pretrainset = get_dataset(ids_pretrain, pretrain=True)
     # train and validation set split
     ids_train = np.arange(N_ANNOTATED)
     #ids_train, ids_valid = train_test_split(ids_train, train_size=0.8, random_state=36)
-    trainset = get_dataset(ids_train, pretrainset.auxiliary_mean, pretrainset.auxiliary_std)
-    #validset = get_dataset(ids_valid, pretrainset.auxiliary_mean, pretrainset.auxiliary_std)
+    trainset = get_dataset(ids_train)
     validset = None
+    #validset = get_dataset(ids_valid, trainset.auxiliary_mean, trainset.auxiliary_std)
     config = DEFAULT_HYPERPARAMETERS
     with wandb.init(config=config, project="ariel-data-challenge"):
         config = wandb.config
         model = Model(config)
-        model.pretrain(True)
-        model = train_early_stopping(model, config, pretrainset, trainset)
+        #model.pretrain(True)
+        #model = train_early_stopping(model, config, pretrainset, trainset)
         model.pretrain(False)
         model = train_epochs(model, config, trainset, validset)
         torch.save(model.state_dict(), f"models/{wandb.run.name}.pt")

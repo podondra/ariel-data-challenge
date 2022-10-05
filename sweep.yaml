@@ -7,20 +7,18 @@ parameters:
     batch_size:
         value: 256
     dropout_probability:
-        value: 0.0
+        distribution: uniform
+        min: 0.0
+        max: 0.5
     learning_rate:
-        value: 0.0001
+        value: 1e-4
     loss:
         value: "kl_divergence"
-    loss_pretrain:
-        values: ["crps", "nll"]
     n_epochs:
-        values: [1024, 2048, 4096]
+        value: 2048
     n_hiddens:
         distribution: int_uniform
-        min: 1
-        max: 8
+        min: 0
+        max: 2
     n_neurons:
-        values: [128, 256, 512, 1024, 2048, 4096]
-    patience:
-        value: 128
+        values: [128, 256, 512]
