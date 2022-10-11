@@ -11,19 +11,18 @@ from torch import nn
 from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
 import wandb
 
 
 DEFAULT_PRIOR_BOUNDS = np.array([[0, -12, -12, -12, -12, -12], [3000, -2, -2, -2, -2, -2]])
 DEFAULT_HYPERPARAMETERS = dict(
         batch_size=256,
-        dropout_probability=0.168,
+        dropout_probability=0.0,
         learning_rate=0.0001,
-        loss="kl_divergence",
+        loss="wasserstein",
         loss_pretrain=None,
-        n_epochs=2048,
-        n_hiddens=1,
+        n_epochs=10000,
+        n_hiddens=4,
         n_neurons=512,
         patience=None)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -94,8 +93,8 @@ def light_track_format(quartiles, filename="data/light_track.csv"):
     # assume test data are arranged in assending order of the planet ID
     df = pd.DataFrame()
     df.index.name = "planet_ID"
-    for i, target in enumerate(['T', 'log_H2O', 'log_CO2','log_CH4','log_CO','log_NH3']):
-        for j, quartile in enumerate(['q1','q2','q3']):
+    for i, target in enumerate(["T", "log_H2O", "log_CO2", "log_CH4", "log_CO", "log_NH3"]):
+        for j, quartile in enumerate(["q1", "q2", "q3"]):
             df[target + "_" + quartile] = quartiles[j, :, i]
     df.to_csv(filename)
     return df
@@ -105,7 +104,7 @@ def normalise(matrix, prior_bounds):
     return (matrix - prior_bounds[0]) / (prior_bounds[1] - prior_bounds[0])
 
 
-def wasserstein(trace1, trace2, w2, prior_bounds=DEFAULT_PRIOR_BOUNDS):
+def emd(trace1, trace2, w2, prior_bounds=DEFAULT_PRIOR_BOUNDS):
     w1 = ot.unif(trace1.shape[0])
     trace1 = normalise(trace1, prior_bounds)
     trace2 = normalise(trace2, prior_bounds)
@@ -119,11 +118,11 @@ def regular_score(traces_pred, ids, tracefile="data/train/ground_truth/traces.hd
     score = 0
     n = ids.shape[0]
     with h5py.File(tracefile, "r") as traces:
-        for i, trace_pred in tqdm(zip(ids, traces_pred), total=n):
+        for i, trace_pred in zip(ids, traces_pred):
             key = "Planet_" + str(i)
             trace = traces[key]["tracedata"][:]
             weights = traces[key]["weights"][:]
-            score += wasserstein(trace_pred, trace, w2=weights)
+            score += emd(trace_pred, trace, w2=weights)
     return 1000 * (1 - score / n)
 
 
@@ -154,39 +153,46 @@ def crps(mean_pred, variance_pred, mean, variance):
     return std_pred * (mean_std * (2.0 * cdf - 1.0) + 2.0 * pdf - 1.0 / torch.sqrt(pi))
 
 
-def kl_divergence(mean_pred, variance_pred, mean, variance):
-    return (torch.log(torch.sqrt(variance_pred) / torch.sqrt(variance))
-            + 0.5 * (variance + torch.square(mean_pred - mean)) / variance_pred - 0.5)
+def kl_divergence(mean_pred, var_pred, mean, var):
+    return (torch.log(var_pred / var) + (var + torch.square(mean_pred - mean)) / var_pred)
+
+
+def wasserstein(mean_pred, var_pred, mean, var):
+    # actually wasserstein squared
+    return torch.square(mean_pred - mean) + torch.square(torch.sqrt(var_pred) - torch.sqrt(var))
 
 
 class Model(nn.Module):
     def __init__(self, config):
         super(Model, self).__init__()
         self.cnn = nn.Sequential(
-                nn.Conv1d(1, 8, 3, padding="same", bias=False), nn.BatchNorm1d(8), nn.ReLU(),
+                nn.Conv1d(1, 8, 3, padding="same"), nn.ReLU(),
                 nn.MaxPool1d(2),
-                nn.Conv1d(8, 16, 3, padding="same", bias=False), nn.BatchNorm1d(16), nn.ReLU(),
+                nn.Conv1d(8, 16, 3, padding="same"), nn.ReLU(),
+                nn.Conv1d(16, 16, 3, padding="same"), nn.ReLU(),
                 nn.MaxPool1d(2),
-                nn.Conv1d(16, 32, 3, padding="same", bias=False), nn.BatchNorm1d(32), nn.ReLU(),
+                nn.Conv1d(16, 32, 3, padding="same"), nn.ReLU(),
+                nn.Conv1d(32, 32, 3, padding="same"), nn.ReLU(),
                 nn.MaxPool1d(2),
-                nn.Conv1d(32, 64, 3, padding="same", bias=False), nn.BatchNorm1d(64), nn.ReLU(),
+                nn.Conv1d(32, 64, 3, padding="same"), nn.ReLU(),
+                nn.Conv1d(64, 64, 3, padding="same"), nn.ReLU(),
                 nn.MaxPool1d(2))
-        self.linear0 = nn.Linear(201, config["n_neurons"], bias=False)
-        self.batchnorm0 = nn.BatchNorm1d(config["n_neurons"])
+        self.linear0 = nn.Linear(201, config["n_neurons"])
         self.dropout0 = nn.Dropout(config["dropout_probability"])
         self.linears = []
-        self.batchnorms = []
         self.dropouts = []
         for i in range(1, config["n_hiddens"] + 1):
-            self.linears.append(nn.Linear(config["n_neurons"], config["n_neurons"], bias=False))
+            self.linears.append(nn.Linear(config["n_neurons"], config["n_neurons"]))
             self.add_module("linear" + str(i), self.linears[-1])
-            self.batchnorms.append(nn.BatchNorm1d(config["n_neurons"]))
-            self.add_module("batchnorm" + str(i), self.batchnorms[-1])
             self.dropouts.append(nn.Dropout(config["dropout_probability"]))
             self.add_module("dropout" + str(i), self.dropouts[-1])
         self.output = nn.Linear(config["n_neurons"], 2 * N_TARGETS)
         self.to(DEVICE)
-        self.losses = {"crps": crps, "kl_divergence": kl_divergence, "nll": nll}
+        self.losses = {
+                "crps": crps,
+                "kl_divergence": kl_divergence,
+                "nll": nll,
+                "wasserstein": wasserstein}
         self.loss_function = self.losses[config["loss"]]
 
     def pretrain(self, flag):
@@ -200,10 +206,10 @@ class Model(nn.Module):
         X = self.cnn(X)
         X = torch.flatten(X, start_dim=1)
         X = torch.cat((X, auxiliary), dim=1)
-        X = F.relu(self.batchnorm0(self.linear0(X)))
+        X = F.relu(self.linear0(X))
         X = self.dropout0(X)
-        for linear, batchnorm, dropout in zip(self.linears, self.batchnorms, self.dropouts):
-            X = F.relu(batchnorm(linear(X)))
+        for linear, dropout in zip(self.linears, self.dropouts):
+            X = F.relu(linear(X))
             X = dropout(X)
         X = self.output(X)
         mean, variance = X[:, :N_TARGETS], X[:, N_TARGETS:]
@@ -227,8 +233,10 @@ class Model(nn.Module):
         mean, variance = Y_pred
         mean, variance = mean.cpu().numpy(), variance.cpu().numpy()
         std = np.sqrt(variance)
-        quartiles_pred = np.stack([norm.ppf(quartile, loc=mean, scale=std) for quartile in QUARTILES])
-        return light_score(dataset.quartiles, quartiles_pred)
+        #sample = np.random.normal(loc=mean, scale=std, size=(T, *mean.shape)).swapaxes(0, 1)
+        #quartiles = np.quantile(sample, QUARTILES, axis=1)
+        quartiles = np.stack([norm.ppf(quartile, loc=mean, scale=std) for quartile in QUARTILES])
+        return light_score(dataset.quartiles, quartiles)
 
 
 def standardise(tensor, mean, std):
@@ -342,10 +350,9 @@ if __name__ == "__main__":
     #pretrainset = get_dataset(ids_pretrain, pretrain=True)
     # train and validation set split
     ids_train = np.arange(N_ANNOTATED)
-    #ids_train, ids_valid = train_test_split(ids_train, train_size=0.8, random_state=36)
+    ids_train, ids_valid = train_test_split(ids_train, train_size=0.8, random_state=36)
     trainset = get_dataset(ids_train)
-    validset = None
-    #validset = get_dataset(ids_valid, trainset.auxiliary_mean, trainset.auxiliary_std)
+    validset = get_dataset(ids_valid, trainset.auxiliary_mean, trainset.auxiliary_std)
     config = DEFAULT_HYPERPARAMETERS
     with wandb.init(config=config, project="ariel-data-challenge"):
         config = wandb.config
@@ -353,5 +360,6 @@ if __name__ == "__main__":
         #model.pretrain(True)
         #model = train_early_stopping(model, config, pretrainset, trainset)
         model.pretrain(False)
-        model = train_epochs(model, config, trainset, validset)
+        #model = train_epochs(model, config, trainset)
+        model = train_early_stopping(model, config, trainset, validset)
         torch.save(model.state_dict(), f"models/{wandb.run.name}.pt")
