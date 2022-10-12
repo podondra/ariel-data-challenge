@@ -19,12 +19,12 @@ DEFAULT_HYPERPARAMETERS = dict(
         batch_size=256,
         dropout_probability=0.0,
         learning_rate=0.0001,
-        loss="wasserstein",
-        loss_pretrain=None,
-        n_epochs=10000,
-        n_hiddens=4,
-        n_neurons=512,
-        patience=None)
+        loss="kl_divergence",
+        loss_pretrain="",
+        n_epochs=2048,
+        n_hiddens=5,
+        n_neurons=1024,
+        patience=1024)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 N = 91392
 N_ANNOTATED = 21988
@@ -141,7 +141,7 @@ def regular_track_format(traces, weights=None, filename="data/regular_track.hdf5
 
 
 def nll(mean_pred, variance_pred, mean, variance):
-    return 0.5 * (torch.log(variance_pred) + (mean - mean_pred).square() / variance_pred)
+    return torch.log(variance_pred) + (mean - mean_pred).square() / variance_pred
 
 
 def crps(mean_pred, variance_pred, mean, variance):
@@ -154,7 +154,7 @@ def crps(mean_pred, variance_pred, mean, variance):
 
 
 def kl_divergence(mean_pred, var_pred, mean, var):
-    return (torch.log(var_pred / var) + (var + torch.square(mean_pred - mean)) / var_pred)
+    return torch.log(var_pred / var) + (var + torch.square(mean_pred - mean)) / var_pred
 
 
 def wasserstein(mean_pred, var_pred, mean, var):
@@ -169,7 +169,6 @@ class Model(nn.Module):
                 nn.Conv1d(1, 8, 3, padding="same"), nn.ReLU(),
                 nn.MaxPool1d(2),
                 nn.Conv1d(8, 16, 3, padding="same"), nn.ReLU(),
-                nn.Conv1d(16, 16, 3, padding="same"), nn.ReLU(),
                 nn.MaxPool1d(2),
                 nn.Conv1d(16, 32, 3, padding="same"), nn.ReLU(),
                 nn.Conv1d(32, 32, 3, padding="same"), nn.ReLU(),
@@ -248,9 +247,11 @@ def scale(tensor):
 
 
 class SpectraDataset(Dataset):
-    def __init__(self, ids, X, auxiliary, auxiliary_mean, auxiliary_std, Y, variance, quartiles):
+    def __init__(self, ids, X, noise, auxiliary, auxiliary_mean, auxiliary_std, Y, variance, quartiles):
         self.ids = ids
-        self.X = scale(X).to(DEVICE)
+        self.X_orig = X.to(DEVICE)
+        self.X = scale(self.X_orig).to(DEVICE)
+        self.noise = noise.to(DEVICE)
         self.auxiliary_mean, self.auxiliary_std = auxiliary_mean, auxiliary_std
         self.auxiliary = standardise(auxiliary, auxiliary_mean, auxiliary_std).to(DEVICE)
         self.Y = Y.to(DEVICE)
@@ -266,6 +267,9 @@ class SpectraDataset(Dataset):
     def __getitem__(self, idx):
         return self.X[idx], self.auxiliary[idx], (self.Y[idx], self.variance[idx])
 
+    def sample(self):
+        self.X = scale(self.X_orig + torch.normal(mean=0.0, std=self.noise))
+
 
 def get_dataset(ids, auxiliary_mean=None, auxiliary_std=None, pretrain=False):
     spectra = read_spectra(ids)
@@ -278,7 +282,7 @@ def get_dataset(ids, auxiliary_mean=None, auxiliary_std=None, pretrain=False):
         Y, variance = read_traces(ids)
         quartiles = read_quartiles_table(ids)
     return SpectraDataset(
-            ids, X, auxiliary,
+            ids, X, noise, auxiliary,
             auxiliary.mean(dim=0) if auxiliary_mean is None else auxiliary_mean,
             auxiliary.std(dim=0) if auxiliary_std is None else auxiliary_std,
             Y, variance, quartiles)
@@ -299,24 +303,25 @@ def train_early_stopping(model, config, trainset, validset):
         model.eval()
         output_train = model.predict(trainset)
         output_valid = model.predict(validset)
-        loss_train = model.loss(output_train, (trainset.Y, trainset.variance)).item()
-        loss_valid = model.loss(output_valid, (validset.Y, validset.variance)).item()
-        score_valid = model.evaluate(output_valid, validset)
-        if loss_valid < loss_valid_best:
+        log = dict()
+        log["loss_train"] = model.loss(output_train, (trainset.Y, trainset.variance)).item()
+        log["loss_valid"] = model.loss(output_valid, (validset.Y, validset.variance)).item()
+        if trainset.quartiles is not None:
+            log["light_score_train"] = model.evaluate(output_train, trainset)
+        log["light_score_valid"] = model.evaluate(output_valid, validset)
+        if log["loss_valid"] < loss_valid_best:
             i = 0
-            loss_valid_best = loss_valid
-            score_valid_at_best = score_valid
-            loss_train_at_best = loss_train
+            loss_train_at_best = log["loss_train"]
+            loss_valid_best = log["loss_valid"]
+            score_train_at_best = log["light_score_train"]
+            score_valid_at_best = log["light_score_valid"]
             model_state_at_best = deepcopy(model.state_dict())
         else:
             i += 1
-        wandb.log({
-            "loss_train": loss_train,
-            "loss_valid": loss_valid,
-            "light_score_valid": score_valid,
-            "loss_valid_best": loss_valid_best})
+        wandb.log(log)
         wandb.run.summary["loss_train"] = loss_train_at_best
         wandb.run.summary["loss_valid"] = loss_valid_best
+        wandb.run.summary["light_score_train"] = score_train_at_best
         wandb.run.summary["light_score_valid"] = score_valid_at_best
     model.load_state_dict(model_state_at_best)
     return model
@@ -350,9 +355,10 @@ if __name__ == "__main__":
     #pretrainset = get_dataset(ids_pretrain, pretrain=True)
     # train and validation set split
     ids_train = np.arange(N_ANNOTATED)
-    ids_train, ids_valid = train_test_split(ids_train, train_size=0.8, random_state=36)
+    #ids_train, ids_valid = train_test_split(ids_train, train_size=0.8, random_state=36)
     trainset = get_dataset(ids_train)
-    validset = get_dataset(ids_valid, trainset.auxiliary_mean, trainset.auxiliary_std)
+    validset = None
+    #validset = get_dataset(ids_valid, trainset.auxiliary_mean, trainset.auxiliary_std)
     config = DEFAULT_HYPERPARAMETERS
     with wandb.init(config=config, project="ariel-data-challenge"):
         config = wandb.config
@@ -360,6 +366,7 @@ if __name__ == "__main__":
         #model.pretrain(True)
         #model = train_early_stopping(model, config, pretrainset, trainset)
         model.pretrain(False)
-        #model = train_epochs(model, config, trainset)
-        model = train_early_stopping(model, config, trainset, validset)
+        trainset.sample()
+        model = train_epochs(model, config, trainset, validset)
+        #model = train_early_stopping(model, config, trainset, validset)
         torch.save(model.state_dict(), f"models/{wandb.run.name}.pt")
