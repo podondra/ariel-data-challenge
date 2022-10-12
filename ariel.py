@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader, Dataset
 import wandb
 
 
-DEFAULT_PRIOR_BOUNDS = np.array([[0, -12, -12, -12, -12, -12], [3000, -2, -2, -2, -2, -2]])
+DEFAULT_PRIOR_BOUNDS = np.array([[0, -12, -12, -12, -12, -12], [7000, -1, -1, -1, -1, -1]])
 DEFAULT_HYPERPARAMETERS = dict(
         batch_size=256,
         dropout_probability=0.0,
@@ -101,7 +101,10 @@ def light_track_format(quartiles, filename="data/light_track.csv"):
 
 
 def normalise(matrix, prior_bounds):
-    return (matrix - prior_bounds[0]) / (prior_bounds[1] - prior_bounds[0])
+    matrix = (matrix - prior_bounds[0]) / (prior_bounds[1] - prior_bounds[0])
+    matrix[matrix < 0] = 0
+    matrix[matrix > 1] = 1
+    return matrix
 
 
 def emd(trace1, trace2, w2, prior_bounds=DEFAULT_PRIOR_BOUNDS):
