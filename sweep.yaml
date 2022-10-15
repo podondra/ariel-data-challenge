@@ -1,8 +1,8 @@
 program: ariel.py
 method: random
 metric:
-    name: loss_valid
-    goal: minimize
+    name: regular_score_valid
+    goal: maximize
 parameters:
     batch_size:
         value: 256
@@ -15,7 +15,7 @@ parameters:
         min: 1e-6
         max: 1e-3
     loss:
-        value: "wasserstein"
+        values: ["kl_divergence", "wasserstein"]
     n_hiddens:
         distribution: int_uniform
         min: 0

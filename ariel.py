@@ -17,12 +17,12 @@ import wandb
 DEFAULT_PRIOR_BOUNDS = np.array([[0, -12, -12, -12, -12, -12], [7000, -1, -1, -1, -1, -1]])
 DEFAULT_HYPERPARAMETERS = dict(
         batch_size=256,
-        dropout_probability=0.0,
-        learning_rate=0.0001,
+        dropout_probability=0.09348930200842576,
+        learning_rate=0.000008151579751128556,
         loss="kl_divergence",
         loss_pretrain="",
-        n_epochs=2048,
-        n_hiddens=5,
+        n_epochs=14440,
+        n_hiddens=3,
         n_neurons=1024,
         patience=1024)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -107,7 +107,7 @@ def normalise(matrix, prior_bounds):
     return matrix
 
 
-def emd(trace1, trace2, w2, prior_bounds=DEFAULT_PRIOR_BOUNDS):
+def earth_movers_distance(trace1, trace2, w2, prior_bounds=DEFAULT_PRIOR_BOUNDS):
     w1 = ot.unif(trace1.shape[0])
     trace1 = normalise(trace1, prior_bounds)
     trace2 = normalise(trace2, prior_bounds)
@@ -125,7 +125,7 @@ def regular_score(traces_pred, ids, tracefile="data/train/ground_truth/traces.hd
             key = "Planet_" + str(i)
             trace = traces[key]["tracedata"][:]
             weights = traces[key]["weights"][:]
-            score += emd(trace_pred, trace, w2=weights)
+            score += earth_movers_distance(trace_pred, trace, w2=weights)
     return 1000 * (1 - score / n)
 
 
@@ -161,7 +161,6 @@ def kl_divergence(mean_pred, var_pred, mean, var):
 
 
 def wasserstein(mean_pred, var_pred, mean, var):
-    # actually wasserstein squared
     return torch.square(mean_pred - mean) + torch.square(torch.sqrt(var_pred) - torch.sqrt(var))
 
 
@@ -356,7 +355,6 @@ def train_epochs(model, config, trainset, validset=None):
 if __name__ == "__main__":
     #ids_pretrain = np.arange(N_ANNOTATED, N)
     #pretrainset = get_dataset(ids_pretrain, pretrain=True)
-    # train and validation set split
     ids_train = np.arange(N_ANNOTATED)
     #ids_train, ids_valid = train_test_split(ids_train, train_size=0.8, random_state=36)
     trainset = get_dataset(ids_train)
@@ -368,8 +366,18 @@ if __name__ == "__main__":
         model = Model(config)
         #model.pretrain(True)
         #model = train_early_stopping(model, config, pretrainset, trainset)
+        #trainset.sample()
         model.pretrain(False)
-        trainset.sample()
         model = train_epochs(model, config, trainset, validset)
         #model = train_early_stopping(model, config, trainset, validset)
         torch.save(model.state_dict(), f"models/{wandb.run.name}.pt")
+
+        #mean_valid, var_valid = model.predict(validset)
+        #mean_valid, var_valid = mean_valid.cpu(), var_valid.cpu()
+        #std_valid = torch.sqrt(var_valid)
+        #T = 5000
+        #sample_valid = np.random.normal(loc=mean_valid, scale=std_valid, size=(T, *mean_valid.shape))
+        #sample_valid = sample_valid.swapaxes(0, 1)
+        #N_REGULAR = 500
+        #regular_score_valid = regular_score(sample_valid[:N_REGULAR], validset.ids[:N_REGULAR])
+        #wandb.log({"regular_score_valid": regular_score_valid})
