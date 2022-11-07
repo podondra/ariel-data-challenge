@@ -122,7 +122,7 @@ def regular_score(traces_pred, ids, tracefile="data/train/ground_truth/traces.hd
             key = "Planet_" + str(i)
             trace = traces[key]["tracedata"][:]
             weights = traces[key]["weights"][:]
-            score += wasserstein(trace_pred, trace, weights_pred, weights)
+            score += earth_movers_distance(trace_pred, trace, weights_pred, weights)
     return 1000 * (1 - score / n)
 
 
@@ -265,7 +265,7 @@ def get_dataset(ids, auxiliary_mean=None, auxiliary_std=None):
             Y, variance, quartiles)
 
 
-def train(model, config, trainset, validset):
+def train_early_stopping(model, config, trainset, validset):
         trainloader = DataLoader(trainset, batch_size=config["batch_size"], shuffle=True)
         optimiser = optim.Adam(model.parameters(), lr=config["learning_rate"])
         log = dict()
