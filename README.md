@@ -1,4 +1,4 @@
-# Ariel Data Challenge
+# Deep Ensemble predicts Exoplanets’ Atmospheres Composition
 
 Standard methods for inferring planetary characteristics from exoplanets’ atmospheric spectra are slow.
 We present a fast machine learning method:
