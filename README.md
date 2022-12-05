@@ -6,7 +6,7 @@ a deep ensemble of convolutional neural networks (CNNs) that outputs mixtures of
 The architecture of our CNN was inspired by VGG networks.
 We train each CNN with Kullback–Leibler divergence as its loss function on simulated exoplanet’ atmospheric spectra and their auxiliary data from Ariel Data Challenge.
 
-The Python script named “ariel.py” trains models, and the Jupyter notebook named “test.ipynb” generates the required outputs.
+The Python script named `ariel.py` trains models, and the Jupyter notebook named `test.ipynb` generates the required outputs.
 
 ## Installation
 
