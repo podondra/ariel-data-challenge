@@ -19,6 +19,11 @@ Python 3.9.6, CUDA 11.3.1, and PyTorch 1.12.1.
     $ pip install torch==1.12.1+cu113 --extra-index-url https://download.pytorch.org/whl/cu113
     $ pip install -r requirements.txt
 
+## Data
+
+Data are available on Zenodo, at https://doi.org/10.5281/zenodo.6770103.
+Concretely, it is the ZIP file `Level2Data.zip`.
+
 ## Contact
 
 Ondřej Podsztavek (podszond@fit.cvut.cz)
