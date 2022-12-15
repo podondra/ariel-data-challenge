@@ -8,6 +8,8 @@ We train each CNN with Kullback–Leibler divergence as its loss function on sim
 
 The Python script named `ariel.py` trains models, and the Jupyter notebook named `test.ipynb` generates the required outputs.
 
+See `slides.pdf` for some information.
+
 ## Installation
 
 Python 3.9.6, CUDA 11.3.1, and PyTorch 1.12.1.
