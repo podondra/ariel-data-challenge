@@ -298,7 +298,7 @@ def train_early_stopping(model, config, trainset, validset):
             wandb.run.summary["loss_train"] = loss_train_at_best
             wandb.run.summary["loss_valid"] = loss_valid_at_best
             wandb.run.summary["light_score_train"] = score_train_at_best
-            wandb.run.summary["light_score_valid"] = score_valid_best
+            wandb.run.summary["light_score_valid"] = log["light_score_valid_best"]
         model.load_state_dict(model_state_at_best)
         return model
 
@@ -329,13 +329,14 @@ def train_epochs(model, config, trainset, validset):
 if __name__ == "__main__":
     # train and validation set split
     ids_train = np.arange(N_ANNOTATED)
-    #ids_train, ids_valid = train_test_split(ids, train_size=0.8, random_state=36)
-    trainset = get_dataset(ids_train)
     validset = None
+    #ids_train, ids_valid = train_test_split(ids_train, train_size=0.8, random_state=36)
+    trainset = get_dataset(ids_train)
     #validset = get_dataset(ids_valid, trainset.auxiliary_mean, trainset.auxiliary_std)
     config = DEFAULT_HYPERPARAMETERS
     with wandb.init(config=config, project="ariel-data-challenge"):
         config = wandb.config
         model = Model(config)
         model = train_epochs(model, config, trainset, validset)
+        #model = train_early_stopping(model, config, trainset, validset)
         torch.save(model.state_dict(), f"models/{wandb.run.name}.pt")
